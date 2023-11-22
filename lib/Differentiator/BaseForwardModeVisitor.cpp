@@ -31,6 +31,8 @@
 
 #include "clad/Differentiator/Compatibility.h"
 
+#include <iostream>
+
 using namespace clang;
 
 namespace clad {
@@ -1178,6 +1180,8 @@ StmtDiff BaseForwardModeVisitor::VisitUnaryOperator(const UnaryOperator* UnOp) {
     return StmtDiff(op, BuildOp(opKind, diff.getExpr_dx()));
   } else if (opKind == UnaryOperatorKind::UO_AddrOf) {
     return StmtDiff(op, BuildOp(opKind, diff.getExpr_dx()));
+  } else if (opKind == UnaryOperatorKind::UO_Not) {
+    return StmtDiff(op, BuildOp(opKind, diff.getExpr_dx()));
   } else {
     unsupportedOpWarn(UnOp->getEndLoc());
     auto zero =
@@ -1781,10 +1785,35 @@ StmtDiff BaseForwardModeVisitor::VisitBreakStmt(const BreakStmt* stmt) {
 StmtDiff
 BaseForwardModeVisitor::VisitCXXConstructExpr(const CXXConstructExpr* CE) {
   llvm::SmallVector<Expr*, 4> clonedArgs, derivedArgs;
-  for (auto arg : CE->arguments()) {
-    auto argDiff = Visit(arg);
-    clonedArgs.push_back(argDiff.getExpr());
-    derivedArgs.push_back(argDiff.getExpr_dx());
+  //CE->dump ();
+  //std::string className = CE->getStmtClassName();
+  //std::cout << className << std::endl;
+  //CE->getConstructor ()->dump();
+  //std::cout << className << std::endl;
+  //CE->getType()->dump();
+  //std::cout << CE->getType()->getAsString () << std::endl;
+  std::string constructedTypeName = QualType::getAsString(CE->getType().split(), PrintingPolicy{ {} });
+
+  // Check if we are in a Kokkos View construction.
+  if (constructedTypeName.rfind("Kokkos::View", 0) == 0) {
+    std::cout << "This is a Kokkos::View !" << std::endl;
+    size_t i = 0;
+    for (auto arg : CE->arguments()) {
+      auto argDiff = Visit(arg);
+      clonedArgs.push_back(argDiff.getExpr());
+      if (i==0)
+        derivedArgs.push_back(argDiff.getExpr_dx());
+      else
+        derivedArgs.push_back(argDiff.getExpr());
+      ++i;
+    }
+  }
+  else {
+    for (auto arg : CE->arguments()) {
+      auto argDiff = Visit(arg);
+      clonedArgs.push_back(argDiff.getExpr());
+      derivedArgs.push_back(argDiff.getExpr_dx());
+    }
   }
   Expr* clonedArgsE = nullptr;
   Expr* derivedArgsE = nullptr;
@@ -1951,6 +1980,34 @@ StmtDiff BaseForwardModeVisitor::VisitCXXBindTemporaryExpr(
   StmtDiff BTEDiff = Visit(BTE->getSubExpr());
   return BTEDiff;
 }
+
+StmtDiff BaseForwardModeVisitor::VisitLambdaExpr(
+    const clang::LambdaExpr* LE) {
+  //for (auto TP : LE->getExplicitTemplateParameters())
+  StmtDiff LEDiff = Visit(LE->getBody());
+  return LEDiff;
+}
+
+StmtDiff BaseForwardModeVisitor::VisitValueStmt(
+    const clang::ValueStmt* VS) {
+  // This is most likely a name provided in a Kokkos::view construction
+  VS->dump ();
+  // Test if StringLiteral
+  if (isa<StringLiteral>(VS)) {
+    std::cout << "This is a StringLiteral!" << std::endl;
+    auto SL = dyn_cast<clang::StringLiteral>(VS);
+
+    std::string name_str("_d_"+ SL->getString().str());
+    StringRef name(name_str);
+
+    Expr* derivedVS = StringLiteral::Create(m_Sema.getASTContext(), name, SL->getKind(), SL->isPascal(), SL->getType(), SL->getBeginLoc());
+    VS->dump ();
+    derivedVS->dump ();
+    return {Clone(VS), derivedVS};
+  }
+  return {Clone(VS), Clone(VS)};
+}
+
 
 StmtDiff BaseForwardModeVisitor::VisitCXXNullPtrLiteralExpr(
     const clang::CXXNullPtrLiteralExpr* NPL) {
