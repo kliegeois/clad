@@ -917,6 +917,57 @@ Expr* DerivativeBuilder::BuildCallToCustomDerivativeOrNumericalDiff(
 }
 
 StmtDiff BaseForwardModeVisitor::VisitCallExpr(const CallExpr* CE) {
+  if (isa<CXXMemberCallExpr>(CE)) {
+    auto MCE = dyn_cast<clang::CXXMemberCallExpr>(CE);
+
+    if (MCE->getObjectType().getAsString().find("Kokkos::View") != std::string::npos) {
+      //std::cout << "Member function called from a Kokkos::View; nothing to do here" << std::endl;
+      return StmtDiff(Clone(CE));
+    }
+  }
+  if (isa<CXXOperatorCallExpr>(CE)) {
+    auto OCE = dyn_cast<clang::CXXOperatorCallExpr>(CE);
+    const Expr* baseOriginalE = OCE->getArg(0);
+
+    bool isKokkosViewAccess = false;
+    std::string kokkosViewName;
+    
+    if (isa<ImplicitCastExpr>(baseOriginalE)) {
+      auto SE = baseOriginalE->IgnoreImpCasts();
+      if (auto DRE = dyn_cast<DeclRefExpr>(SE)) {
+        std::string constructedTypeName = QualType::getAsString(DRE->getType().split(), PrintingPolicy{ {} });
+        std::cout << constructedTypeName << std::endl;
+        if (constructedTypeName.find("Kokkos::View") != std::string::npos) {
+          isKokkosViewAccess = true;
+          kokkosViewName = DRE->getNameInfo().getName().getAsString ();
+        }
+      }
+    }
+
+    //if (OCE->getOperator().getAsString().find("Kokkos::View") != std::string::npos) {
+    //  std::cout << "Operator called from a Kokkos::View; nothing to do here" << std::endl;
+    //}
+
+    // Calling the function without computing derivatives
+    //llvm::SmallVector<Expr*, 4> ClonedArgs;
+    //for (unsigned i = 0, e = CE->getNumArgs(); i < e; ++i)
+    //  ClonedArgs.push_back(Clone(CE->getArg(i)));
+//
+    //Expr* Call = m_Sema
+    //                 .ActOnCallExpr(getCurrentScope(), Clone(CE->getCallee()),
+    //                                noLoc, ClonedArgs, noLoc)
+    //                 .get();
+/*
+    // Creating a zero derivative
+    auto* zero =
+        ConstantFolder::synthesizeLiteral(m_Context.IntTy, m_Context, 0);
+*/
+    // Returning the function call and zero derivative
+    if (isKokkosViewAccess) {
+      std::cout << " kokkosViewName = " << kokkosViewName << std::endl;
+      return StmtDiff(Clone(CE), Clone(CE));
+    }
+  }
   const FunctionDecl* FD = CE->getDirectCallee();
   if (!FD) {
     diag(DiagnosticsEngine::Warning, CE->getBeginLoc(),
@@ -1011,6 +1062,13 @@ StmtDiff BaseForwardModeVisitor::VisitCallExpr(const CallExpr* CE) {
     if (BaseForwardModeVisitor::IsDifferentiableType(arg->getType())) {
       Expr* dArg = argDiff.getExpr_dx();
       QualType CallArgTy = CallArgs.back()->getType();
+
+      std::string error_message = "Type mismatch, we might fail to instantiate a pullback with types " +
+             QualType::getAsString(CallArgTy.split(), PrintingPolicy{ {} }) + " and " +
+             QualType::getAsString(dArg->getType().split(), PrintingPolicy{ {} });
+      if (!(!dArg || m_Context.hasSameType(CallArgTy, dArg->getType()))) {
+        std::cout << error_message.c_str() << std::endl;
+      }
       assert((!dArg || m_Context.hasSameType(CallArgTy, dArg->getType())) &&
              "Type mismatch, we might fail to instantiate a pullback");
       (void)CallArgTy;
@@ -1796,9 +1854,26 @@ BaseForwardModeVisitor::VisitCXXConstructExpr(const CXXConstructExpr* CE) {
 
   // Check if we are in a Kokkos View construction.
   if (constructedTypeName.rfind("Kokkos::View", 0) == 0) {
-    std::cout << "This is a Kokkos::View !" << std::endl;
+    size_t runTimeDim = 0;
+    std::vector<size_t> compileTimeDims;
+    bool read = false;
+    for (size_t i = 0; i < constructedTypeName.size(); ++i) { 
+      if (read && constructedTypeName[i] == '*')
+        ++runTimeDim;
+      if (read && constructedTypeName[i] == '[')
+        compileTimeDims.push_back(std::stoi(&constructedTypeName[i+1]));
+      if (!read && constructedTypeName[i] == ' ')
+        read = true;
+    } 
+    //std::cout << "runTimeDim = " << runTimeDim << std::endl;
+    //std::cout << "compileTimeDim = " << compileTimeDims.size() << std::endl;
+    //for (auto compileTimeDim : compileTimeDims)
+    //  std::cout << "  compileTimeDim = " << compileTimeDim << std::endl;
+
     size_t i = 0;
     for (auto arg : CE->arguments()) {
+      if (i == runTimeDim + 1)
+        break;
       auto argDiff = Visit(arg);
       clonedArgs.push_back(argDiff.getExpr());
       if (i==0)
