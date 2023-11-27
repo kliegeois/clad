@@ -944,28 +944,31 @@ StmtDiff BaseForwardModeVisitor::VisitCallExpr(const CallExpr* CE) {
       }
     }
 
-    //if (OCE->getOperator().getAsString().find("Kokkos::View") != std::string::npos) {
-    //  std::cout << "Operator called from a Kokkos::View; nothing to do here" << std::endl;
-    //}
-
-    // Calling the function without computing derivatives
-    //llvm::SmallVector<Expr*, 4> ClonedArgs;
-    //for (unsigned i = 0, e = CE->getNumArgs(); i < e; ++i)
-    //  ClonedArgs.push_back(Clone(CE->getArg(i)));
-//
-    //Expr* Call = m_Sema
-    //                 .ActOnCallExpr(getCurrentScope(), Clone(CE->getCallee()),
-    //                                noLoc, ClonedArgs, noLoc)
-    //                 .get();
-/*
-    // Creating a zero derivative
-    auto* zero =
-        ConstantFolder::synthesizeLiteral(m_Context.IntTy, m_Context, 0);
-*/
     // Returning the function call and zero derivative
     if (isKokkosViewAccess) {
-      std::cout << " kokkosViewName = " << kokkosViewName << std::endl;
-      return StmtDiff(Clone(CE), Clone(CE));
+
+      llvm::SmallVector<Expr*, 4> ClonedArgs;
+      for (unsigned i = 1, e = CE->getNumArgs(); i < e; ++i)
+        ClonedArgs.push_back(Clone(CE->getArg(i)));
+
+      Expr* Call = m_Sema
+                      .ActOnCallExpr(getCurrentScope(), Clone(CE->getArg(0)),
+                                      noLoc, ClonedArgs, noLoc)
+                      .get();
+
+      // replace kokkosViewName with "_d_"+kokkosViewName
+
+      Expr* dView = Visit(CE->getArg(0)).getExpr_dx();
+
+      dView->dump();
+
+      Expr* dCall = m_Sema
+                      .ActOnCallExpr(getCurrentScope(), dView,
+                                      noLoc, ClonedArgs, noLoc)
+                      .get();
+
+      //std::cout << " kokkosViewName = " << kokkosViewName << std::endl;
+      return StmtDiff(Call, dCall);
     }
   }
   const FunctionDecl* FD = CE->getDirectCallee();
