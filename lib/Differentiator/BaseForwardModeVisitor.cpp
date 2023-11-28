@@ -971,6 +971,33 @@ StmtDiff BaseForwardModeVisitor::VisitCallExpr(const CallExpr* CE) {
       return StmtDiff(Call, dCall);
     }
   }
+
+  auto SE = CE->getCallee()->IgnoreImpCasts();
+  if (auto DRE = dyn_cast<DeclRefExpr>(SE)) {
+    if (auto FD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
+      if (FD->getQualifiedNameAsString().find("Kokkos::deep_copy") != std::string::npos) {
+
+        llvm::SmallVector<Expr*, 4> ClonedArgs;
+        llvm::SmallVector<Expr*, 4> ClonedDArgs;
+        for (unsigned i = 0, e = CE->getNumArgs(); i < e; ++i) {
+          ClonedArgs.push_back(Clone(CE->getArg(i)));
+          ClonedDArgs.push_back(Visit(CE->getArg(i)).getExpr_dx());
+        }
+
+        Expr* Call = m_Sema
+                        .ActOnCallExpr(getCurrentScope(), Clone(CE->getCallee()),
+                                        noLoc, ClonedArgs, noLoc)
+                        .get();
+        Expr* dCall = m_Sema
+                        .ActOnCallExpr(getCurrentScope(), Clone(CE->getCallee()),
+                                        noLoc, ClonedDArgs, noLoc)
+                        .get();
+
+        return StmtDiff(Call, dCall);
+      }
+    }
+  }
+
   const FunctionDecl* FD = CE->getDirectCallee();
   if (!FD) {
     diag(DiagnosticsEngine::Warning, CE->getBeginLoc(),
@@ -1071,6 +1098,7 @@ StmtDiff BaseForwardModeVisitor::VisitCallExpr(const CallExpr* CE) {
              QualType::getAsString(dArg->getType().split(), PrintingPolicy{ {} });
       if (!(!dArg || m_Context.hasSameType(CallArgTy, dArg->getType()))) {
         std::cout << error_message.c_str() << std::endl;
+        CE->dump();
       }
       assert((!dArg || m_Context.hasSameType(CallArgTy, dArg->getType())) &&
              "Type mismatch, we might fail to instantiate a pullback");
