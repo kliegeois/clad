@@ -11,6 +11,7 @@
 #include "ArrayRef.h"
 #include "BuiltinDerivatives.h"
 #include "CladConfig.h"
+#include "DynamicGraph.h"
 #include "FunctionTraits.h"
 #include "Matrix.h"
 #include "NumericalDiff.h"
@@ -74,6 +75,27 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
     return of.back();
   }
 
+  /// The purpose of this function is to initialize adjoints
+  /// (or all of its differentiable fields) with 0.
+  // FIXME: Add support for objects.
+  /// Initialize a non-array variable.
+  template <typename T> CUDA_HOST_DEVICE void zero_init(T& x) { new (&x) T(); }
+
+  /// Initialize a non-const sized array when the size is known and is equal to
+  /// N.
+  template <typename T> CUDA_HOST_DEVICE void zero_init(T* x, std::size_t N) {
+    for (std::size_t i = 0; i < N; ++i)
+    zero_init(x[i]);
+  }
+
+  /// Initialize a const sized array.
+  // NOLINTBEGIN(cppcoreguidelines-avoid-c-arrays)
+  template <typename T, std::size_t N>
+  CUDA_HOST_DEVICE void zero_init(T (&arr)[N]) {
+    zero_init((T*)arr, N);
+  }
+  // NOLINTEND(cppcoreguidelines-avoid-c-arrays)
+
   /// Pad the args supplied with nullptr(s) or zeros to match the the num of
   /// params of the function and then execute the function using the padded args
   /// i.e. we are adding default arguments as we cannot do that with
@@ -93,36 +115,41 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
   ///   return f(1.0, 2.0, 0, 0);
   // for executing non-member functions
   template <bool EnablePadding, class... Rest, class F, class... Args,
+            class... fArgTypes,
             typename std::enable_if<EnablePadding, bool>::type = true>
   CUDA_HOST_DEVICE return_type_t<F>
-  execute_with_default_args(list<Rest...>, F f, Args&&... args) {
+  execute_with_default_args(list<Rest...>, F f, list<fArgTypes...>,
+                            Args&&... args) {
     return f(static_cast<Args>(args)..., static_cast<Rest>(nullptr)...);
   }
 
   template <bool EnablePadding, class... Rest, class F, class... Args,
+            class... fArgTypes,
             typename std::enable_if<!EnablePadding, bool>::type = true>
   return_type_t<F> execute_with_default_args(list<Rest...>, F f,
+                                             list<fArgTypes...>,
                                              Args&&... args) {
     return f(static_cast<Args>(args)...);
   }
 
   // for executing member-functions
   template <bool EnablePadding, class... Rest, class ReturnType, class C,
-            class Obj, class... Args,
+            class Obj, class... Args, class... fArgTypes,
             typename std::enable_if<EnablePadding, bool>::type = true>
-  CUDA_HOST_DEVICE auto execute_with_default_args(list<Rest...>,
-                                                  ReturnType C::*f, Obj&& obj,
-                                                  Args&&... args)
+  CUDA_HOST_DEVICE auto
+  execute_with_default_args(list<Rest...>, ReturnType C::*f, Obj&& obj,
+                            list<fArgTypes...>, Args&&... args)
       -> return_type_t<decltype(f)> {
-    return (static_cast<Obj>(obj).*f)(static_cast<Args>(args)...,
+    return (static_cast<Obj>(obj).*f)((fArgTypes)(args)...,
                                       static_cast<Rest>(nullptr)...);
   }
 
   template <bool EnablePadding, class... Rest, class ReturnType, class C,
-            class Obj, class... Args,
+            class Obj, class... Args, class... fArgTypes,
             typename std::enable_if<!EnablePadding, bool>::type = true>
   auto execute_with_default_args(list<Rest...>, ReturnType C::*f, Obj&& obj,
-                                 Args&&... args) -> return_type_t<decltype(f)> {
+                                 list<fArgTypes...>, Args&&... args)
+      -> return_type_t<decltype(f)> {
     return (static_cast<Obj>(obj).*f)(static_cast<Args>(args)...);
   }
 
@@ -237,8 +264,10 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
       CUDA_HOST_DEVICE return_type_t<CladFunctionType>
       execute_helper(Fn f, Args&&... args) {
         // `static_cast` is required here for perfect forwarding.
-        return execute_with_default_args<EnablePadding>(
-            DropArgs_t<sizeof...(Args), F>{}, f, static_cast<Args>(args)...);
+      return execute_with_default_args<EnablePadding>(
+          DropArgs_t<sizeof...(Args), F>{}, f,
+          TakeNFirstArgs_t<sizeof...(Args), decltype(f)>{},
+          static_cast<Args>(args)...);
       }
 
       /// Helper functions for executing member derived functions.
@@ -254,9 +283,10 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
       return_type_t<CladFunctionType>
       execute_helper(ReturnType C::*f, Obj&& obj, Args&&... args) {
         // `static_cast` is required here for perfect forwarding.
-        return execute_with_default_args<EnablePadding>(
-            DropArgs_t<sizeof...(Args), decltype(f)>{}, f,
-            static_cast<Obj>(obj), static_cast<Args>(args)...);
+      return execute_with_default_args<EnablePadding>(
+          DropArgs_t<sizeof...(Args), decltype(f)>{}, f, static_cast<Obj>(obj),
+          TakeNFirstArgs_t<sizeof...(Args), decltype(f)>{},
+          static_cast<Args>(args)...);
       }
       /// If user have not passed object explicitly, then this specialization
       /// will be used and derived function will be called through the object
@@ -270,6 +300,7 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
         // `static_cast` is required here for perfect forwarding.
         return execute_with_default_args<EnablePadding>(
             DropArgs_t<sizeof...(Args), decltype(f)>{}, f, *m_Functor,
+            TakeNFirstArgs_t<sizeof...(Args), decltype(f)>{},
             static_cast<Args>(args)...);
       }
   };
@@ -358,9 +389,8 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
   /// \param[in] args independent parameters information
   /// \returns `CladFunction` object to access the corresponding derived
   /// function.
-  template <unsigned... BitMaskedOpts /*To check for enzyme*/,
-            typename ArgSpec = const char*, typename F,
-            typename DerivedFnType = GradientDerivedFnTraits_t<F>,
+  template <unsigned... BitMaskedOpts, typename ArgSpec = const char*,
+            typename F, typename DerivedFnType = GradientDerivedFnTraits_t<F>,
             typename = typename std::enable_if<
                 !std::is_class<remove_reference_and_pointer_t<F>>::value>::type>
   CladFunction<DerivedFnType, ExtractFunctorTraits_t<F>, true> __attribute__((
@@ -376,9 +406,8 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
   /// Specialization for differentiating functors.
   /// The specialization is needed because objects have to be passed
   /// by reference whereas functions have to be passed by value.
-  template <unsigned... BitMaskedOpts /*To check for enzyme*/,
-            typename ArgSpec = const char*, typename F,
-            typename DerivedFnType = GradientDerivedFnTraits_t<F>,
+  template <unsigned... BitMaskedOpts, typename ArgSpec = const char*,
+            typename F, typename DerivedFnType = GradientDerivedFnTraits_t<F>,
             typename = typename std::enable_if<
                 std::is_class<remove_reference_and_pointer_t<F>>::value>::type>
   CladFunction<DerivedFnType, ExtractFunctorTraits_t<F>, true> __attribute__((
@@ -397,8 +426,8 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
   /// \param[in] args independent parameters information
   /// \returns `CladFunction` object to access the corresponding derived
   /// function.
-  template <typename ArgSpec = const char*, typename F,
-            typename DerivedFnType = HessianDerivedFnTraits_t<F>,
+  template <unsigned... BitMaskedOpts, typename ArgSpec = const char*,
+            typename F, typename DerivedFnType = HessianDerivedFnTraits_t<F>,
             typename = typename std::enable_if<
                 !std::is_class<remove_reference_and_pointer_t<F>>::value>::type>
   CladFunction<DerivedFnType, ExtractFunctorTraits_t<F>> __attribute__((
@@ -406,18 +435,16 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
   hessian(F f, ArgSpec args = "",
           DerivedFnType derivedFn = static_cast<DerivedFnType>(nullptr),
           const char* code = "") {
-    assert(f && "Must pass in a non-0 argument");
-    return CladFunction<
-        DerivedFnType,
-        ExtractFunctorTraits_t<F>>(derivedFn /* will be replaced by hessian*/,
-                                   code);
+      assert(f && "Must pass in a non-0 argument");
+      return CladFunction<DerivedFnType, ExtractFunctorTraits_t<F>>(
+          derivedFn /* will be replaced by hessian*/, code);
   }
 
   /// Specialization for differentiating functors.
   /// The specialization is needed because objects have to be passed
   /// by reference whereas functions have to be passed by value.
-  template <typename ArgSpec = const char*, typename F,
-            typename DerivedFnType = HessianDerivedFnTraits_t<F>,
+  template <unsigned... BitMaskedOpts, typename ArgSpec = const char*,
+            typename F, typename DerivedFnType = HessianDerivedFnTraits_t<F>,
             typename = typename std::enable_if<
                 std::is_class<remove_reference_and_pointer_t<F>>::value>::type>
   CladFunction<DerivedFnType, ExtractFunctorTraits_t<F>> __attribute__((
@@ -425,10 +452,8 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
   hessian(F&& f, ArgSpec args = "",
           DerivedFnType derivedFn = static_cast<DerivedFnType>(nullptr),
           const char* code = "") {
-    return CladFunction<
-        DerivedFnType,
-        ExtractFunctorTraits_t<F>>(derivedFn /* will be replaced by hessian*/,
-                                   code, f);
+      return CladFunction<DerivedFnType, ExtractFunctorTraits_t<F>>(
+          derivedFn /* will be replaced by hessian*/, code, f);
   }
 
   /// Generates function which computes jacobian matrix of the given function
@@ -438,8 +463,8 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
   /// \param[in] args independent parameters information
   /// \returns `CladFunction` object to access the corresponding derived
   /// function.
-  template <typename ArgSpec = const char*, typename F,
-            typename DerivedFnType = JacobianDerivedFnTraits_t<F>,
+  template <unsigned... BitMaskedOpts, typename ArgSpec = const char*,
+            typename F, typename DerivedFnType = JacobianDerivedFnTraits_t<F>,
             typename = typename std::enable_if<
                 !std::is_class<remove_reference_and_pointer_t<F>>::value>::type>
   CladFunction<DerivedFnType, ExtractFunctorTraits_t<F>> __attribute__((
@@ -447,18 +472,16 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
   jacobian(F f, ArgSpec args = "",
            DerivedFnType derivedFn = static_cast<DerivedFnType>(nullptr),
            const char* code = "") {
-    assert(f && "Must pass in a non-0 argument");
-    return CladFunction<
-        DerivedFnType,
-        ExtractFunctorTraits_t<F>>(derivedFn /* will be replaced by Jacobian*/,
-                                   code);
+      assert(f && "Must pass in a non-0 argument");
+      return CladFunction<DerivedFnType, ExtractFunctorTraits_t<F>>(
+          derivedFn /* will be replaced by Jacobian*/, code);
   }
 
   /// Specialization for differentiating functors.
   /// The specialization is needed because objects have to be passed
   /// by reference whereas functions have to be passed by value.
-  template <typename ArgSpec = const char*, typename F,
-            typename DerivedFnType = JacobianDerivedFnTraits_t<F>,
+  template <unsigned... BitMaskedOpts, typename ArgSpec = const char*,
+            typename F, typename DerivedFnType = JacobianDerivedFnTraits_t<F>,
             typename = typename std::enable_if<
                 std::is_class<remove_reference_and_pointer_t<F>>::value>::type>
   CladFunction<DerivedFnType, ExtractFunctorTraits_t<F>> __attribute__((
@@ -466,10 +489,8 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
   jacobian(F&& f, ArgSpec args = "",
            DerivedFnType derivedFn = static_cast<DerivedFnType>(nullptr),
            const char* code = "") {
-    return CladFunction<
-        DerivedFnType,
-        ExtractFunctorTraits_t<F>>(derivedFn /* will be replaced by Jacobian*/,
-                                   code, f);
+      return CladFunction<DerivedFnType, ExtractFunctorTraits_t<F>>(
+          derivedFn /* will be replaced by Jacobian*/, code, f);
   }
 
   template <typename ArgSpec = const char*, typename F,

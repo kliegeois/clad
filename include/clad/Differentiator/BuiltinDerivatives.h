@@ -20,7 +20,35 @@ namespace clad {
 template <typename T, typename U> struct ValueAndPushforward {
   T value;
   U pushforward;
+
+  // Define the cast operator from ValueAndPushforward<T, U> to
+  // ValueAndPushforward<V, w> where V is convertible to T and W is
+  // convertible to U.
+  template <typename V = T, typename W = U>
+  operator ValueAndPushforward<V, W>() const {
+    return {static_cast<V>(value), static_cast<W>(pushforward)};
+  }
 };
+
+/// It is used to identify constructor custom pushforwards. For
+/// constructor custom pushforward functions, we cannot use the same
+/// strategy which we use for custom pushforward for member
+/// functions. Member functions custom pushforward have the following
+/// signature:
+///
+/// mem_fn_pushforward(ClassName *c, ..., ClassName *d_c, ...)
+///
+/// We use the first argument 'ClassName *c' to determine the class of member
+/// function for which the pushforward is defined.
+///
+/// In the case of constructor pushforward, there are no objects of the class
+/// type passed to the constructor. Therefore, we cannot simply use arguments
+/// to determine the class. To solve this, 'ConstructorPushforwardTag<T>' is
+/// used. A custom_derivative pushforward for constructor is required to have
+/// 'ConstructorPushforwardTag<T>' as the first argument, where 'T' is the
+/// class for which constructor pushforward is defined.
+template <class T> class ConstructorPushforwardTag {};
+
 namespace custom_derivatives {
 #ifdef __CUDACC__
 template <typename T>
@@ -112,9 +140,8 @@ CUDA_HOST_DEVICE ValueAndPushforward<T, T> log_pushforward(T x, T d_x) {
 }
 
 template <typename T1, typename T2, typename T3>
-CUDA_HOST_DEVICE void pow_pullback(T1 x, T2 exponent, T3 d_y,
-                                   clad::array_ref<decltype(T1())> d_x,
-                                   clad::array_ref<decltype(T2())> d_exponent) {
+CUDA_HOST_DEVICE void pow_pullback(T1 x, T2 exponent, T3 d_y, T1* d_x,
+                                   T2* d_exponent) {
   auto t = pow_pushforward(x, exponent, static_cast<T1>(1), static_cast<T2>(0));
   *d_x += t.pushforward * d_y;
   t = pow_pushforward(x, exponent, static_cast<T1>(0), static_cast<T2>(1));
@@ -131,10 +158,8 @@ fma_pushforward(T1 a, T2 b, T3 c, T1 d_a, T2 d_b, T3 d_c) {
 }
 
 template <typename T1, typename T2, typename T3, typename T4>
-CUDA_HOST_DEVICE void fma_pullback(T1 a, T2 b, T3 c, T4 d_y,
-                                   clad::array_ref<decltype(T1())> d_a,
-                                   clad::array_ref<decltype(T2())> d_b,
-                                   clad::array_ref<decltype(T3())> d_c) {
+CUDA_HOST_DEVICE void fma_pullback(T1 a, T2 b, T3 c, T4 d_y, T1* d_a, T2* d_b,
+                                   T3* d_c) {
   *d_a += b * d_y;
   *d_b += a * d_y;
   *d_c += d_y;
@@ -153,9 +178,8 @@ max_pushforward(const T& a, const T& b, const T& d_a, const T& d_b) {
 }
 
 template <typename T, typename U>
-CUDA_HOST_DEVICE void min_pullback(const T& a, const T& b, U d_y,
-                                   clad::array_ref<decltype(T())> d_a,
-                                   clad::array_ref<decltype(T())> d_b) {
+CUDA_HOST_DEVICE void min_pullback(const T& a, const T& b, U d_y, T* d_a,
+                                   T* d_b) {
   if (a < b)
     *d_a += d_y;
   else
@@ -163,9 +187,8 @@ CUDA_HOST_DEVICE void min_pullback(const T& a, const T& b, U d_y,
 }
 
 template <typename T, typename U>
-CUDA_HOST_DEVICE void max_pullback(const T& a, const T& b, U d_y,
-                                   clad::array_ref<decltype(T())> d_a,
-                                   clad::array_ref<decltype(T())> d_b) {
+CUDA_HOST_DEVICE void max_pullback(const T& a, const T& b, U d_y, T* d_a,
+                                   T* d_b) {
   if (a < b)
     *d_b += d_y;
   else
@@ -182,10 +205,7 @@ clamp_pushforward(const T& v, const T& lo, const T& hi, const T& d_v,
 
 template <typename T, typename U>
 CUDA_HOST_DEVICE void clamp_pullback(const T& v, const T& lo, const T& hi,
-                                     const U& d_y,
-                                     clad::array_ref<decltype(T())> d_v,
-                                     clad::array_ref<decltype(T())> d_lo,
-                                     clad::array_ref<decltype(T())> d_hi) {
+                                     const U& d_y, T* d_v, T* d_lo, T* d_hi) {
   if (v < lo)
     *d_lo += d_y;
   else if (hi < v)
@@ -196,6 +216,31 @@ CUDA_HOST_DEVICE void clamp_pullback(const T& v, const T& lo, const T& hi,
 #endif
 
 } // namespace std
+
+// NOLINTBEGIN(cppcoreguidelines-no-malloc)
+// NOLINTBEGIN(cppcoreguidelines-owning-memory)
+inline ValueAndPushforward<void*, void*> malloc_pushforward(size_t sz,
+                                                            size_t d_sz) {
+  return {malloc(sz), malloc(sz)};
+}
+
+inline ValueAndPushforward<void*, void*>
+calloc_pushforward(size_t n, size_t sz, size_t d_n, size_t d_sz) {
+  return {calloc(n, sz), calloc(n, sz)};
+}
+
+inline ValueAndPushforward<void*, void*>
+realloc_pushforward(void* ptr, size_t sz, void* d_ptr, size_t d_sz) {
+  return {realloc(ptr, sz), realloc(d_ptr, sz)};
+}
+
+inline void free_pushforward(void* ptr, void* d_ptr) {
+  free(ptr);
+  free(d_ptr);
+}
+// NOLINTEND(cppcoreguidelines-owning-memory)
+// NOLINTEND(cppcoreguidelines-no-malloc)
+
 // These are required because C variants of mathematical functions are
 // defined in global namespace.
 using std::abs_pushforward;

@@ -1,9 +1,12 @@
-// RUN: %cladclang %s -std=c++17 -I%S/../../include -oLoops.out 2>&1 | FileCheck %s
-// RUN: ./Loops.out | FileCheck -check-prefix=CHECK-EXEC %s
+// RUN: %cladclang %s -std=c++17 -I%S/../../include -oLoops.out 2>&1 | %filecheck %s
+// RUN: ./Loops.out | %filecheck_exec %s
 // CHECK-NOT: {{.*error|warning|note:.*}}
 
 #include "clad/Differentiator/Differentiator.h"
+#include "clad/Differentiator/STLBuiltins.h"
+#include <initializer_list>
 #include <cmath>
+#include "../TestUtils.h"
 
 double f1(double x, int y) {
     double r = 1.0;
@@ -288,9 +291,10 @@ double fn7(double i, double j) {
 // CHECK-NEXT:     int b = 3;
 // CHECK-NEXT:     double _d_res = 0;
 // CHECK-NEXT:     double res = 0;
-// CHECK-NEXT:     while (double a = b)
+// CHECK-NEXT:     double _d_a;
+// CHECK-NEXT:     double a;
+// CHECK-NEXT:     while ((_d_a = _d_b) , (a = b))
 // CHECK-NEXT:         {
-// CHECK-NEXT:             double _d_a = _d_b;
 // CHECK-NEXT:             _d_a += _d_i;
 // CHECK-NEXT:             a += i;
 // CHECK-NEXT:             _d_res += _d_a;
@@ -343,9 +347,10 @@ double fn9(double i, double j) {
 // CHECK-NEXT:     int counter = 4;
 // CHECK-NEXT:     double _d_a = _d_i * j + i * _d_j;
 // CHECK-NEXT:     double a = i * j;
-// CHECK-NEXT:     while (int num = counter)
+// CHECK-NEXT:     int _d_num;
+// CHECK-NEXT:     int num;
+// CHECK-NEXT:     while ((_d_num = _d_counter) , (num = counter))
 // CHECK-NEXT:         {
-// CHECK-NEXT:             int _d_num = _d_counter;
 // CHECK-NEXT:             _d_counter -= 0;
 // CHECK-NEXT:             counter -= 1;
 // CHECK-NEXT:             if (num == 2)
@@ -377,8 +382,9 @@ double fn10_darg0(double x, size_t n);
 // CHECK-NEXT:     double res = 0;
 // CHECK-NEXT:     {
 // CHECK-NEXT:         size_t _d_count = 0;
-// CHECK-NEXT:         size_t _d_max_count = _d_n;
-// CHECK-NEXT:         for (size_t count = 0; {{.*}}max_count{{.*}}; ++count) {
+// CHECK-NEXT:         size_t _d_max_count;
+// CHECK-NEXT:         size_t max_count;
+// CHECK-NEXT:         for (size_t count = 0; (_d_max_count = _d_n) , (max_count = n); ++count) {
 // CHECK-NEXT:             if (count >= max_count)
 // CHECK-NEXT:                 break;
 // CHECK-NEXT:             {
@@ -392,6 +398,190 @@ double fn10_darg0(double x, size_t n);
 // CHECK-NEXT:     }
 // CHECK-NEXT:     return _d_res;
 // CHECK-NEXT: }
+
+double fn11(double x, double y) {
+    double r = 0;
+    for (int i = 0; (r = x); ++i) {
+        if (i == 3) break;
+        r += x;
+    }
+    return r;
+} // fn11(x,y) == x
+
+double fn11_darg0(double x, double y);
+// CHECK:      double fn11_darg0(double x, double y) {
+// CHECK-NEXT:          double _d_x = 1;
+// CHECK-NEXT:          double _d_y = 0;
+// CHECK-NEXT:          double _d_r = 0;
+// CHECK-NEXT:          double r = 0;
+// CHECK-NEXT:          {
+// CHECK-NEXT:              int _d_i = 0;
+// CHECK-NEXT:              for (int i = 0; (_d_r = _d_x) , (r = x); ++i) {
+// CHECK-NEXT:                      if (i == 3)
+// CHECK-NEXT:                          break;
+// CHECK-NEXT:                      _d_r += _d_x;
+// CHECK-NEXT:                      r += x;
+// CHECK-NEXT:              }
+// CHECK-NEXT:          }
+// CHECK-NEXT:          return _d_r;
+// CHECK-NEXT:      }
+
+double fn12(double x, double y) {
+    double r = 0;
+    for (int i = 0; double c = x; ++i) {
+        if (i == 3) break;
+        c += x;
+        r = c;
+    }
+    return r;
+} // fn11(x,y) == 2*x
+
+double fn12_darg0(double x, double y);
+// CHECK:      double fn12_darg0(double x, double y) {
+// CHECK-NEXT:          double _d_x = 1;
+// CHECK-NEXT:          double _d_y = 0;
+// CHECK-NEXT:          double _d_r = 0;
+// CHECK-NEXT:          double r = 0;
+// CHECK-NEXT:          {
+// CHECK-NEXT:              int _d_i = 0;
+// CHECK-NEXT:              double _d_c;
+// CHECK-NEXT:              double c;
+// CHECK-NEXT:              for (int i = 0; (_d_c = _d_x) , (c = x); ++i) {
+// CHECK-NEXT:                      if (i == 3)
+// CHECK-NEXT:                          break;
+// CHECK-NEXT:                      _d_c += _d_x;
+// CHECK-NEXT:                      c += x;
+// CHECK-NEXT:                      _d_r = _d_c;
+// CHECK-NEXT:                      r = c;
+// CHECK-NEXT:              }
+// CHECK-NEXT:          }
+// CHECK-NEXT:          return _d_r;
+// CHECK-NEXT:      }
+
+double fn13(double u, double v) {
+    double res = 0;
+    for (; (res = u * v) && (u = 0) ;) {}
+    return res;
+} // = u*v
+
+double fn13_darg0(double u, double v);
+// CHECK:           double fn13_darg0(double u, double v) {
+// CHECK-NEXT:               double _d_u = 1;
+// CHECK-NEXT:               double _d_v = 0;
+// CHECK-NEXT:               double _d_res = 0;
+// CHECK-NEXT:               double res = 0;
+// CHECK-NEXT:               for (; ((_d_res = _d_u * v + u * _d_v) , (res = u * v)) && ((_d_u = 0) , (u = 0));) {
+// CHECK-NEXT:               }
+// CHECK-NEXT:               return _d_res;
+// CHECK-NEXT:           }
+
+double fn14(double x) {
+    double r = 0;
+    double t = x;
+    for (int i = 0; (r = t) || false; ++i) {
+        if (i == 3) break;
+        x += r;
+    }
+    return x;
+} // = 4*x
+
+double fn14_darg0(double x);
+// CHECK:       double fn14_darg0(double x) {
+// CHECK-NEXT:           double _d_x = 1;
+// CHECK-NEXT:           double _d_r = 0;
+// CHECK-NEXT:           double r = 0;
+// CHECK-NEXT:           double _d_t = _d_x;
+// CHECK-NEXT:           double t = x;
+// CHECK-NEXT:           {
+// CHECK-NEXT:               int _d_i = 0;
+// CHECK-NEXT:               for (int i = 0; ((_d_r = _d_t) , (r = t)) || false; ++i) {
+// CHECK-NEXT:                   if (i == 3)
+// CHECK-NEXT:                       break;
+// CHECK-NEXT:                   _d_x += _d_r;
+// CHECK-NEXT:                   x += r;
+// CHECK-NEXT:               }
+// CHECK-NEXT:           }
+// CHECK-NEXT:           return _d_x;
+// CHECK-NEXT:       }
+
+double fn15(double u, double v) {
+    double res = 0;
+    for (; !(res = u * v) ;) {}
+    return 2*res;
+}
+
+double fn15_darg0(double u, double v);
+//CHECK:       double fn15_darg0(double u, double v) {
+// CHECK-NEXT:      double _d_u = 1;
+// CHECK-NEXT:      double _d_v = 0;
+// CHECK-NEXT:      double _d_res = 0;
+// CHECK-NEXT:      double res = 0;
+// CHECK-NEXT:      for (; (_d_res = _d_u * v + u * _d_v) , !(res = u * v);) {
+// CHECK-NEXT:      }
+// CHECK-NEXT:      return 0 * res + 2 * _d_res;
+// CHECK-NEXT:  }
+
+double fn16(double x) {
+    while (double t = (x = 0)) {}
+    return x;
+} // = 0
+
+double fn16_darg0(double x);
+// CHECK:       double fn16_darg0(double x) {
+// CHECK-NEXT:       double _d_x = 1;
+// CHECK-NEXT:       double _d_t;
+// CHECK-NEXT:       double t;
+// CHECK-NEXT:       while ((_d_t = (_d_x = 0)) , (t = (x = 0)))
+// CHECK-NEXT:       {
+// CHECK-NEXT:       }
+// CHECK-NEXT:       return _d_x;
+// CHECK-NEXT: }
+
+double fn17(double x) {
+    while ((x = 0) || false) {}
+    return x;
+} // = 0
+
+double fn17_darg0(double x);
+// CHECK: double fn17_darg0(double x) {
+// CHECK-NEXT:     double _d_x = 1;
+// CHECK-NEXT:     while (((_d_x = 0) , (x = 0)) || false)
+// CHECK-NEXT:         {
+// CHECK-NEXT:         }
+// CHECK-NEXT:     return _d_x;
+// CHECK-NEXT: }
+
+double fn18(double u, double v) {
+    auto dl = {u, v, u*v};
+    double res = 0;
+    auto dl_end = dl.end();
+    for (auto i = dl.begin(); i != dl_end; ++i)
+        res += *i;
+    return res;
+}
+
+// CHECK: double fn18_darg0(double u, double v) {
+// CHECK-NEXT:     double _d_u = 1;
+// CHECK-NEXT:     double _d_v = 0;
+// CHECK-NEXT:     {{.*}}initializer_list<double> _d_dl = {_d_u, _d_v, _d_u * v + u * _d_v};
+// CHECK-NEXT:     {{.*}}initializer_list<double> dl = {u, v, u * v};
+// CHECK-NEXT:     double _d_res = 0;
+// CHECK-NEXT:     double res = 0;
+// CHECK-NEXT:     {{.*}}ValueAndPushforward<{{.*}}, {{.*}}> _t0 = {{.*}}end_pushforward(&dl, &_d_dl);
+// CHECK-NEXT:     {{.*}}_d_dl_end = _t0.pushforward;
+// CHECK-NEXT:     {{.*}}dl_end = _t0.value;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         {{.*}}ValueAndPushforward<{{.*}}, {{.*}}> _t1 = {{.*}}begin_pushforward(&dl, &_d_dl);
+// CHECK-NEXT:         {{.*}}_d_i = _t1.pushforward;
+// CHECK-NEXT:         for ({{.*}}i = _t1.value; i != dl_end; ++_d_i , ++i) {
+// CHECK-NEXT:             _d_res += *_d_i;
+// CHECK-NEXT:             res += *i;
+// CHECK-NEXT:         }
+// CHECK-NEXT:     }
+// CHECK-NEXT:     return _d_res;
+// CHECK-NEXT: }
+
+
 
 #define TEST(fn)\
 auto d_##fn = clad::differentiate(fn, "i");\
@@ -430,4 +620,36 @@ int main() {
 
   clad::differentiate(fn10, 0);
   printf("Result is = %.2f\n", fn10_darg0(3, 5)); // CHECK-EXEC: Result is = 30.00
+
+  clad::differentiate(fn11, 0);
+  printf("Result is = %.2f\n", fn11_darg0(3, 5)); // CHECK-EXEC: Result is = 1.00
+  printf("Result is = %.2f\n", fn11_darg0(-3, 6)); // CHECK-EXEC: Result is = 1.00
+  printf("Result is = %.2f\n", fn11_darg0(1, 5)); // CHECK-EXEC: Result is = 1.00
+
+  clad::differentiate(fn12, 0);
+  printf("Result is = %.2f\n", fn12_darg0(3, 5)); // CHECK-EXEC: Result is = 2.00
+  printf("Result is = %.2f\n", fn12_darg0(-3, 6)); // CHECK-EXEC: Result is = 2.00
+  printf("Result is = %.2f\n", fn12_darg0(1, 5)); // CHECK-EXEC: Result is = 2.00
+
+  clad::differentiate(fn13, 0);
+  printf("Result is = %.2f\n", fn13_darg0(3, 4)); // CHECK-EXEC: Result is = 4.00
+  printf("Result is = %.2f\n", fn13_darg0(-3, 5)); // CHECK-EXEC: Result is = 5.00
+  printf("Result is = %.2f\n", fn13_darg0(1, 6)); // CHECK-EXEC: Result is = 6.00
+
+  clad::differentiate(fn14, 0);
+  printf("Result is = %.2f\n", fn14_darg0(3)); // CHECK-EXEC: Result is = 4.00
+  printf("Result is = %.2f\n", fn14_darg0(-3)); // CHECK-EXEC: Result is = 4.00
+  printf("Result is = %.2f\n", fn14_darg0(1)); // CHECK-EXEC: Result is = 4.00
+
+  clad::differentiate(fn15, 0);
+  printf("Result is = %.2f\n", fn15_darg0(7, 3)); // CHECK-EXEC: Result is = 6.00
+
+  clad::differentiate(fn16, 0);
+  printf("Result is = %.2f\n", fn16_darg0(5)); // CHECK-EXEC: Result is = 0
+
+  clad::differentiate(fn17, 0);
+  printf("Result is = %.2f\n", fn17_darg0(5)); // CHECK-EXEC: Result is = 0
+
+  INIT_DIFFERENTIATE(fn18, "u");
+  TEST_DIFFERENTIATE(fn18, 3, 5);  // CHECK-EXEC: {6.00}
 }

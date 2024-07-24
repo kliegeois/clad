@@ -1,5 +1,7 @@
 #include "clad/Differentiator/DiffPlanner.h"
 
+#include "TBRAnalyzer.h"
+
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Basic/SourceManager.h"
@@ -232,9 +234,10 @@ namespace clad {
   }
 
   DiffCollector::DiffCollector(DeclGroupRef DGR, DiffInterval& Interval,
-                               DiffSchedule& plans, clang::Sema& S)
-      : m_Interval(Interval), m_DiffPlans(plans), m_TopMostFD(nullptr),
-        m_Sema(S) {
+                               clad::DynamicGraph<DiffRequest>& requestGraph,
+                               clang::Sema& S, RequestOptions& opts)
+      : m_Interval(Interval), m_DiffRequestGraph(requestGraph), m_Sema(S),
+        m_Options(opts) {
 
     if (Interval.empty())
       return;
@@ -272,11 +275,35 @@ namespace clad {
   }
 
   void DiffRequest::UpdateDiffParamsInfo(Sema& semaRef) {
+    // Diff info for pullbacks is generated automatically,
+    // its parameters are not provided by the user.
+    if (Mode == DiffMode::experimental_pullback) {
+      // Might need to update DVI args, as they may be pointing to the
+      // declaration parameters, not the definition parameters.
+      if (!Function->getPreviousDecl())
+        // If the function was never declared before, we can safely assume
+        // that the parameters are correctly referring to the definition ones.
+        return;
+      const FunctionDecl* FD = Function->getPreviousDecl();
+      for (size_t i = 0, e = DVI.size(), paramIdx = 0;
+           i < e && paramIdx < FD->getNumParams(); ++i) {
+        const auto* param = DVI[i].param;
+        while (paramIdx < FD->getNumParams() &&
+               FD->getParamDecl(paramIdx) != param) {
+            ++paramIdx;
+        }
+        if (paramIdx != FD->getNumParams())
+            // Update the parameter to point to the definition parameter.
+            DVI[i].param = Function->getParamDecl(paramIdx);
+      }
+      return;
+    }
     DVI.clear();
     auto& C = semaRef.getASTContext();
     const Expr* diffArgs = Args;
     const FunctionDecl* FD = Function;
-    FD = FD->getDefinition();
+    if (!DeclarationOnly)
+      FD = FD->getDefinition();
     if (!diffArgs || !FD) {
       return;
     }
@@ -458,7 +485,11 @@ namespace clad {
     // Case 2)
     // Check if the provided literal can be evaluated as an integral value.
     llvm::APSInt intValue;
-    if (clad_compat::Expr_EvaluateAsInt(E, intValue, C)) {
+    Expr::EvalResult res;
+    Expr::SideEffectsKind AllowSideEffects =
+        Expr::SideEffectsKind::SE_NoSideEffects;
+    if (E->EvaluateAsInt(res, C, AllowSideEffects)) {
+      intValue = res.Val.getInt();
       DiffInputVarInfo dVarInfo;
       auto idx = intValue.getExtValue();
       // If we are differentiating a call operator that have no parameters, then
@@ -530,6 +561,30 @@ namespace clad {
     return;
   }
 
+  bool DiffRequest::shouldBeRecorded(Expr* E) const {
+    if (!EnableTBRAnalysis)
+      return true;
+
+    if (!isa<DeclRefExpr>(E) && !isa<ArraySubscriptExpr>(E) &&
+        !isa<MemberExpr>(E))
+      return true;
+
+    // FIXME: currently, we allow all pointer operations to be stored.
+    // This is not correct, but we need to implement a more advanced analysis
+    // to determine which pointer operations are useful to store.
+    if (E->getType()->isPointerType())
+      return true;
+
+    if (!m_TbrRunInfo.HasAnalysisRun) {
+      TBRAnalyzer analyzer(Function->getASTContext(),
+                           m_TbrRunInfo.ToBeRecorded);
+      analyzer.Analyze(Function);
+      m_TbrRunInfo.HasAnalysisRun = true;
+    }
+    auto found = m_TbrRunInfo.ToBeRecorded.find(E->getBeginLoc());
+    return found != m_TbrRunInfo.ToBeRecorded.end();
+  }
+
   bool DiffCollector::VisitCallExpr(CallExpr* E) {
     // Check if we should look into this.
     // FIXME: Generated code does not usually have valid source locations.
@@ -556,12 +611,13 @@ namespace clad {
         return true;
       DiffRequest request{};
 
-      if (A->getAnnotation().equals("D")) {
-        request.Mode = DiffMode::forward;
-
-        // bitmask_opts is a template pack of unsigned integers, so we need to
-        // do bitwise or of all the values to get the final value.
-        unsigned bitmasked_opts_value = 0;
+      // bitmask_opts is a template pack of unsigned integers, so we need to
+      // do bitwise or of all the values to get the final value.
+      unsigned bitmasked_opts_value = 0;
+      bool enable_tbr_in_req = false;
+      bool disable_tbr_in_req = false;
+      if (!A->getAnnotation().equals("E") &&
+          FD->getTemplateSpecializationArgs()) {
         const auto template_arg = FD->getTemplateSpecializationArgs()->get(0);
         if (template_arg.getKind() == TemplateArgument::Pack)
           for (const auto& arg :
@@ -569,14 +625,47 @@ namespace clad {
             bitmasked_opts_value |= arg.getAsIntegral().getExtValue();
         else
           bitmasked_opts_value = template_arg.getAsIntegral().getExtValue();
+
+        // Set option for TBR analysis.
+        enable_tbr_in_req =
+            clad::HasOption(bitmasked_opts_value, clad::opts::enable_tbr);
+        disable_tbr_in_req =
+            clad::HasOption(bitmasked_opts_value, clad::opts::disable_tbr);
+        if (enable_tbr_in_req && disable_tbr_in_req) {
+          utils::EmitDiag(m_Sema, DiagnosticsEngine::Error, endLoc,
+                          "Both enable and disable TBR options are specified.");
+          return true;
+        }
+        if (enable_tbr_in_req || disable_tbr_in_req) {
+          // override the default value of TBR analysis.
+          request.EnableTBRAnalysis = enable_tbr_in_req && !disable_tbr_in_req;
+        } else {
+          request.EnableTBRAnalysis = m_Options.EnableTBRAnalysis;
+        }
+        if (clad::HasOption(bitmasked_opts_value, clad::opts::diagonal_only)) {
+          if (!A->getAnnotation().equals("H")) {
+            utils::EmitDiag(m_Sema, DiagnosticsEngine::Error, endLoc,
+                            "Diagonal only option is only valid for Hessian "
+                            "mode.");
+            return true;
+          }
+        }
+      }
+
+      if (A->getAnnotation().equals("D")) {
+        request.Mode = DiffMode::forward;
         unsigned derivative_order =
             clad::GetDerivativeOrder(bitmasked_opts_value);
         if (derivative_order == 0) {
           derivative_order = 1; // default to first order derivative.
         }
         request.RequestedDerivativeOrder = derivative_order;
-        if (clad::HasOption(bitmasked_opts_value, clad::opts::use_enzyme)) {
+        if (clad::HasOption(bitmasked_opts_value, clad::opts::use_enzyme))
           request.use_enzyme = true;
+        if (enable_tbr_in_req) {
+          utils::EmitDiag(m_Sema, DiagnosticsEngine::Error, endLoc,
+                          "TBR analysis is not meant for forward mode AD.");
+          return true;
         }
         if (clad::HasOption(bitmasked_opts_value, clad::opts::vector_mode)) {
           request.Mode = DiffMode::vector_forward_mode;
@@ -596,22 +685,14 @@ namespace clad {
           }
         }
       } else if (A->getAnnotation().equals("H")) {
-        request.Mode = DiffMode::hessian;
+        if (clad::HasOption(bitmasked_opts_value, clad::opts::diagonal_only))
+          request.Mode = DiffMode::hessian_diagonal;
+        else
+          request.Mode = DiffMode::hessian;
       } else if (A->getAnnotation().equals("J")) {
         request.Mode = DiffMode::jacobian;
       } else if (A->getAnnotation().equals("G")) {
         request.Mode = DiffMode::reverse;
-
-        // bitmask_opts is a template pack of unsigned integers, so we need to
-        // do bitwise or of all the values to get the final value.
-        unsigned bitmasked_opts_value = 0;
-        const auto template_arg = FD->getTemplateSpecializationArgs()->get(0);
-        if (template_arg.getKind() == TemplateArgument::Pack)
-          for (const auto& arg :
-               FD->getTemplateSpecializationArgs()->get(0).pack_elements())
-            bitmasked_opts_value |= arg.getAsIntegral().getExtValue();
-        else
-          bitmasked_opts_value = template_arg.getAsIntegral().getExtValue();
         if (clad::HasOption(bitmasked_opts_value, clad::opts::use_enzyme))
           request.use_enzyme = true;
         // reverse vector mode is not yet supported.
@@ -641,7 +722,7 @@ namespace clad {
       llvm::SaveAndRestore<const FunctionDecl*> saveTopMost = m_TopMostFD;
       m_TopMostFD = FD;
       TraverseDecl(derivedFD);
-      m_DiffPlans.push_back(std::move(request));
+      m_DiffRequestGraph.addNode(request, /*isSource=*/true);
     }
     /*else if (m_TopMostFD) {
       // If another function is called inside differentiated function,

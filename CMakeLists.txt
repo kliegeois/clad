@@ -1,5 +1,24 @@
 cmake_minimum_required(VERSION 3.7.0)
 
+enable_language(CXX)
+set(CMAKE_CXX_EXTENSIONS NO)
+
+include(GNUInstallDirs)
+
+# MUST be done before call to clad project
+get_cmake_property(_cache_vars CACHE_VARIABLES)
+foreach(_cache_var ${_cache_vars})
+  get_property(_helpstring CACHE ${_cache_var} PROPERTY HELPSTRING)
+  if(_helpstring STREQUAL 
+    "No help, variable specified on the command line.")
+    set(CMAKE_ARGS "${CMAKE_ARGS} -D${_cache_var}=\"${${_cache_var}}\"")
+  endif()
+endforeach()
+
+# Generate CMakeArgs.txt file with source, build dir and command line args
+write_file("${CMAKE_CURRENT_BINARY_DIR}/CMakeArgs.txt"
+  "-S${CMAKE_SOURCE_DIR} -B${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_ARGS}")
+
 if(POLICY CMP0075)
   cmake_policy(SET CMP0075 NEW)
 endif()
@@ -20,12 +39,12 @@ if( CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR )
 
   ## Define clad supported version of clang and llvm
 
-  set(CLANG_MIN_SUPPORTED 7.0)
-  set(CLANG_MAX_SUPPORTED "17.0.x")
-  set(CLANG_VERSION_UPPER_BOUND 17.1.0)
-  set(LLVM_MIN_SUPPORTED 7.0)
-  set(LLVM_MAX_SUPPORTED "17.0.x")
-  set(LLVM_VERSION_UPPER_BOUND 17.1.0)
+  set(CLANG_MIN_SUPPORTED 8.0)
+  set(CLANG_MAX_SUPPORTED "18.1.x")
+  set(CLANG_VERSION_UPPER_BOUND 18.2.0)
+  set(LLVM_MIN_SUPPORTED 8.0)
+  set(LLVM_MAX_SUPPORTED "18.1.x")
+  set(LLVM_VERSION_UPPER_BOUND 18.2.0)
 
   if (NOT DEFINED Clang_DIR)
     set(Clang_DIR ${LLVM_DIR})
@@ -263,6 +282,10 @@ install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/
   PATTERN "*.inc"
   )
 
+install(FILES cmake/modules/AddClad.cmake
+  DESTINATION lib/cmake/clad
+  )
+
 add_definitions( -D_GNU_SOURCE
   -DCLAD_SRCDIR_INCL="${CLAD_SOURCE_DIR}/include"
   -DCLAD_INSTDIR_INCL="${CLAD_BINARY_DIR}/include" )
@@ -299,30 +322,37 @@ if (NOT CLAD_BUILD_STATIC_ONLY)
     include(GoogleBenchmark)
   endif(CLAD_ENABLE_BENCHMARKS)
 
-  # Change the default compiler to the clang which we run clad upon. Our unittests
-  # need to use a supported by clad compiler. Note that's a huge hack and it is
-  # not guaranteed to work with cmake.
-  set(stored_cxx_compiler ${CMAKE_CXX_COMPILER})
-  set(stored_cxx_flags ${CMAKE_CXX_FLAGS})
-
-  set(CMAKE_CXX_COMPILER ${LLVM_TOOLS_BINARY_DIR}/clang)
-  # Filter some unsupported flags by clang.
-  string(REPLACE "-fno-lifetime-dse" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-  string(REPLACE "-Wno-class-memaccess" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-
-  add_subdirectory(unittests)
-  add_subdirectory(test)
   add_subdirectory(demos/ErrorEstimation/CustomModel)
   add_subdirectory(demos/ErrorEstimation/PrintModel)
+
+  if (NOT CLAD_DISABLE_TESTS OR CLAD_ENABLE_BENCHMARKS)
+    # Change the default compiler to the clang which we run clad upon. Our unittests
+    # need to use a supported by clad compiler. Note that's a huge hack and it is
+    # not guaranteed to work with cmake.
+    set(stored_cxx_compiler ${CMAKE_CXX_COMPILER})
+    set(stored_cxx_flags ${CMAKE_CXX_FLAGS})
+
+    set(CMAKE_CXX_COMPILER ${LLVM_TOOLS_BINARY_DIR}/clang)
+    # Filter some unsupported flags by clang.
+    string(REPLACE "-fno-lifetime-dse" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    string(REPLACE "-Wno-class-memaccess" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  endif()
+
+  if (NOT CLAD_DISABLE_TESTS)
+    add_subdirectory(unittests)
+    add_subdirectory(test)
+  endif()
 
   # Add benchmarking infrastructure.
   if (CLAD_ENABLE_BENCHMARKS)
     add_subdirectory(benchmark)
   endif(CLAD_ENABLE_BENCHMARKS)
 
-  # Restore the default compiler.
-  set(CMAKE_CXX_COMPILER ${stored_cxx_compiler})
-  set(CMAKE_CXX_FLAGS ${stored_cxx_flags})
+  if (stored_cxx_compiler)
+    # Restore the default compiler.
+    set(CMAKE_CXX_COMPILER ${stored_cxx_compiler})
+    set(CMAKE_CXX_FLAGS ${stored_cxx_flags})
+  endif()
 endif()
 
 # Workaround for MSVS10 to avoid the Dialog Hell

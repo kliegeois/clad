@@ -26,7 +26,9 @@ Checks: >
   -readability-magic-numbers,
   -readability-named-parameter,
   -readability-function-cognitive-complexity,
+  -readability-implicit-bool-conversion,
   -cppcoreguidelines-avoid-magic-numbers,
+  -clang-analyzer-cplusplus.NewDeleteLeaks,
 
 CheckOptions:
   - key:             readability-identifier-naming.ClassCase
@@ -55,3 +57,19 @@ CheckOptions:
     value:           1
   - key:             readability-magic-numbers.IgnoredIntegerValues
     value:           4;8;16;
+  - key:             bugprone-argument-comment.CommentNullPtrs
+    value:           1
+  - key:             bugprone-argument-comment.CommentBoolLiterals
+    value:           1
+  - key:             bugprone-argument-comment.StrictMode
+    value:           1
+  - key:             bugprone-argument-comment.CommentIntegerLiterals
+    value:           1
+  - key:             bugprone-argument-comment.CommentUserDefinedLiterals
+    value:           1
+  - key:             bugprone-argument-comment.CommentStringLiterals
+    value:           1
+  - key:             bugprone-argument-comment.CommentFloatLiterals
+    value:           1
+  - key:             bugprone-argument-comment.CommentCharacterLiterals
+    value:           1

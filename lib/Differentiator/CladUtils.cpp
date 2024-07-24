@@ -6,9 +6,11 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/Basic/Builtins.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Sema/Lookup.h"
 #include "llvm/ADT/SmallVector.h"
+#include <clang/AST/DeclCXX.h>
 #include "clad/Differentiator/Compatibility.h"
 
 using namespace clang;
@@ -76,10 +78,8 @@ namespace clad {
         return "operator_less_equal";
       case OverloadedOperatorKind::OO_GreaterEqual:
         return "operator_greater_equal";
-#if CLANG_VERSION_MAJOR > 5
       case OverloadedOperatorKind::OO_Spaceship:
         return "operator_spaceship";
-#endif
       case OverloadedOperatorKind::OO_AmpAmp:
         return "operator_AmpAmp";
       case OverloadedOperatorKind::OO_PipePipe:
@@ -99,8 +99,23 @@ namespace clad {
       case OverloadedOperatorKind::OO_Subscript:
         return "operator_subscript";
       default:
+        if (isa<CXXConstructorDecl>(FD))
+          return "constructor";
         return FD->getNameAsString();
       }
+    }
+
+    Stmt* unwrapIfSingleStmt(Stmt* S) {
+      if (!S)
+        return nullptr;
+      if (!isa<CompoundStmt>(S))
+        return S;
+      auto* CS = cast<CompoundStmt>(S);
+      if (CS->size() == 0)
+        return nullptr;
+      if (CS->size() == 1)
+        return CS->body_front();
+      return CS;
     }
 
     CompoundStmt* PrependAndCreateCompoundStmt(ASTContext& C, Stmt* initial,
@@ -165,22 +180,22 @@ namespace clad {
         utils::BuildNNS(semaRef, const_cast<clang::DeclContext*>(declContext), CSS);
         NestedNameSpecifier* NS = CSS.getScopeRep();
         if (auto* Prefix = NS->getPrefix())
-          return C.getElaboratedType(ETK_None, Prefix, QT);
+          return C.getElaboratedType(clad_compat::ElaboratedTypeKeyword_None,
+                                     Prefix, QT);
       }
       return QT;
     }
 
     DeclContext* FindDeclContext(clang::Sema& semaRef, clang::DeclContext* DC1,
                                  clang::DeclContext* DC2) {
-      // llvm::errs()<<"DC1 name: "<<DC1->getDeclKindName()<<"\n";
-      // llvm::errs()<<"DC2 name: "<<DC2->getDeclKindName()<<"\n";
-      // cast<Decl>(DC1)->dumpColor();
       llvm::SmallVector<clang::DeclContext*, 4> contexts;
       assert((isa<NamespaceDecl>(DC1) || isa<TranslationUnitDecl>(DC1)) &&
              "DC1 can only be extended if it is a "
              "namespace or translation unit decl.");
       while (DC2) {
-        // llvm::errs()<<"DC2 name: "<<DC2->getDeclKindName()<<"\n";
+        // If somewhere along the way we reach DC1, then we can break the loop.
+        if (DC2->Equals(DC1))
+          break;
         if (isa<TranslationUnitDecl>(DC2))
           break;
         if (isa<LinkageSpecDecl>(DC2)) {
@@ -226,8 +241,9 @@ namespace clad {
       DeclContext* DC = DC1;
       for (int i = contexts.size() - 1; i >= 0; --i) {
         NamespaceDecl* ND = cast<NamespaceDecl>(contexts[i]);
-        DC = LookupNSD(semaRef, ND->getIdentifier()->getName(),
-                       /*shouldExist=*/false, DC1);
+        if (ND->getIdentifier())
+          DC = LookupNSD(semaRef, ND->getIdentifier()->getName(),
+                         /*shouldExist=*/false, DC1);
         if (!DC)
           return nullptr;
         DC1 = DC;
@@ -284,16 +300,15 @@ namespace clad {
     StringLiteral* CreateStringLiteral(ASTContext& C, llvm::StringRef str) {
       // Copied and adapted from clang::Sema::ActOnStringLiteral.
       QualType CharTyConst = C.CharTy.withConst();
-      QualType
-          StrTy = clad_compat::getConstantArrayType(C, CharTyConst,
-                                                    llvm::APInt(/*numBits=*/32,
-                                                                str.size() + 1),
-                                                    /*SizeExpr=*/nullptr,
-                                                    /*ASM=*/ArrayType::Normal,
-                                                    /*IndexTypeQuals*/ 0);
-      StringLiteral* SL = StringLiteral::Create(C, str,
-                                                /*Kind=*/clad_compat::StringKind_Ordinary,
-                                                /*Pascal=*/false, StrTy, noLoc);
+      QualType StrTy = clad_compat::getConstantArrayType(
+          C, CharTyConst, llvm::APInt(/*numBits=*/32, str.size() + 1),
+          /*SizeExpr=*/nullptr,
+          /*ASM=*/clad_compat::ArraySizeModifier_Normal,
+          /*IndexTypeQuals*/ 0);
+      StringLiteral* SL = StringLiteral::Create(
+          C, str,
+          /*Kind=*/clad_compat::StringLiteralKind_Ordinary,
+          /*Pascal=*/false, StrTy, noLoc);
       return SL;
     }
 
@@ -352,6 +367,13 @@ namespace clad {
 
     bool IsReferenceOrPointerType(QualType T) {
       return T->isReferenceType() || isArrayOrPointerType(T) || IsKokkosView(T);
+
+    bool IsReferenceOrPointerArg(const Expr* arg) {
+      // The argument is passed by reference if it's passed as an L-value.
+      // However, if arg is a MaterializeTemporaryExpr, then arg is a
+      // temporary variable passed as a const reference.
+      bool isRefType = arg->isLValue() && !isa<MaterializeTemporaryExpr>(arg);
+      return isRefType || isArrayOrPointerType(arg->getType());
     }
 
     bool SameCanonicalType(clang::QualType T1, clang::QualType T2) {
@@ -393,12 +415,14 @@ namespace clad {
     BuildParmVarDecl(clang::Sema& semaRef, clang::DeclContext* DC,
                      clang::IdentifierInfo* II, clang::QualType T,
                      clang::StorageClass SC, clang::Expr* defArg,
-                     clang::TypeSourceInfo* TSI) {
+                     clang::TypeSourceInfo* TSI, clang::SourceLocation Loc) {
       ASTContext& C = semaRef.getASTContext();
       if (!TSI)
         TSI = C.getTrivialTypeSourceInfo(T, noLoc);
+      if (Loc.isInvalid())
+        Loc = utils::GetValidSLoc(semaRef);
       ParmVarDecl* PVD =
-          ParmVarDecl::Create(C, DC, noLoc, noLoc, II, T, TSI, SC, defArg);
+          ParmVarDecl::Create(C, DC, Loc, Loc, II, T, TSI, SC, defArg);
       return PVD;
     }
 
@@ -450,6 +474,12 @@ namespace clad {
       auto& C = semaRef.getASTContext();
       if (!TSI)
         TSI = C.getTrivialTypeSourceInfo(qType);
+      if (clad_compat::isa_and_nonnull<ImplicitValueInitExpr>(initializer))
+        // If the initializer is an implicit value init expression, then
+        // we don't need to pass it explicitly to the CXXNewExpr. As, clang
+        // internally adds it when initializer is ParenListExpr and
+        // DirectInitRange is valid.
+        initializer = semaRef.ActOnParenListExpr(noLoc, noLoc, {}).get();
       auto newExpr =
           semaRef
               .BuildCXXNew(
@@ -690,6 +720,54 @@ namespace clad {
              isa<CharacterLiteral>(E) || isa<StringLiteral>(E) ||
              isa<ObjCBoolLiteralExpr>(E) || isa<CXXBoolLiteralExpr>(E) ||
              isa<GNUNullExpr>(E);
+    }
+
+    bool IsZeroOrNullValue(const clang::Expr* E) {
+      if (!E)
+        return true;
+      if (const auto* ICE = dyn_cast<ImplicitCastExpr>(E))
+        return IsZeroOrNullValue(ICE->getSubExpr());
+      if (isa<CXXNullPtrLiteralExpr>(E))
+        return true;
+      if (const auto* FL = dyn_cast<FloatingLiteral>(E))
+        return FL->getValue().isZero();
+      if (const auto* IL = dyn_cast<IntegerLiteral>(E))
+        return IL->getValue() == 0;
+      if (const auto* SL = dyn_cast<StringLiteral>(E))
+        return SL->getLength() == 0;
+      return false;
+    }
+
+    bool IsMemoryFunction(const clang::FunctionDecl* FD) {
+
+#if CLANG_VERSION_MAJOR > 12
+      if (FD->getBuiltinID() == Builtin::BImalloc)
+        return true;
+      if (FD->getBuiltinID() == Builtin::ID::BIcalloc)
+        return true;
+      if (FD->getBuiltinID() == Builtin::ID::BIrealloc)
+        return true;
+      if (FD->getBuiltinID() == Builtin::ID::BImemset)
+        return true;
+#else
+      if (FD->getNameAsString() == "malloc")
+        return true;
+      if (FD->getNameAsString() == "calloc")
+        return true;
+      if (FD->getNameAsString() == "realloc")
+        return true;
+      if (FD->getNameAsString() == "memset")
+        return true;
+#endif
+      return false;
+    }
+
+    bool IsMemoryDeallocationFunction(const clang::FunctionDecl* FD) {
+#if CLANG_VERSION_MAJOR > 12
+      return FD->getBuiltinID() == Builtin::ID::BIfree;
+#else
+      return FD->getNameAsString() == "free";
+#endif
     }
   } // namespace utils
 } // namespace clad

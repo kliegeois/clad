@@ -27,6 +27,8 @@ public:
   void ActOnEndOfDerive() override;
   void ActAfterParsingDiffArgs(const DiffRequest& request,
                                DiffParams& args) override;
+  void
+  ActAfterProcessingArraySubscriptExpr(const clang::Expr* revArrSub) override;
   void ActBeforeCreatingDerivedFnParamTypes(unsigned& numExtraParams) override;
   void ActAfterCreatingDerivedFnParamTypes(
       llvm::SmallVectorImpl<clang::QualType>& paramTypes) override;
@@ -40,27 +42,26 @@ public:
   void ActBeforeDifferentiatingStmtInVisitCompoundStmt() override;
   void ActAfterProcessingStmtInVisitCompoundStmt() override;
   void ActBeforeDifferentiatingSingleStmtBranchInVisitIfStmt() override;
-  void ActBeforeFinalisingVisitBranchSingleStmtInIfVisitStmt() override;
+  void ActBeforeFinalizingVisitBranchSingleStmtInIfVisitStmt() override;
   void ActBeforeDifferentiatingLoopInitStmt() override;
   void ActBeforeDifferentiatingSingleStmtLoopBody() override;
   void ActAfterProcessingSingleStmtBodyInVisitForLoop() override;
-  void ActBeforeFinalisingVisitReturnStmt(StmtDiff& retExprDiff) override;
+  void ActBeforeFinalizingVisitReturnStmt(StmtDiff& retExprDiff) override;
   void ActBeforeFinalizingVisitCallExpr(
       const clang::CallExpr*& CE, clang::Expr*& OverloadedDerivedFn,
       llvm::SmallVectorImpl<clang::Expr*>& derivedCallArgs,
-      llvm::SmallVectorImpl<clang::VarDecl*>& ArgResultDecls,
-      bool asGrad) override;
-  void ActBeforeFinalisingPostIncDecOp(StmtDiff& diff) override;
+      llvm::SmallVectorImpl<clang::Expr*>& ArgResult, bool asGrad) override;
+  void ActBeforeFinalizingPostIncDecOp(StmtDiff& diff) override;
   void ActAfterCloningLHSOfAssignOp(clang::Expr*&, clang::Expr*&,
                                     clang::BinaryOperatorKind& opCode) override;
-  void ActBeforeFinalisingAssignOp(clang::Expr*&, clang::Expr*&) override;
+  void ActBeforeFinalizingAssignOp(clang::Expr*&, clang::Expr*&, clang::Expr*&,
+                                   clang::BinaryOperator::Opcode&) override;
   void ActOnStartOfDifferentiateSingleStmt() override;
   void ActBeforeFinalizingDifferentiateSingleStmt(const direction& d) override;
   void ActBeforeFinalizingDifferentiateSingleExpr(const direction& d) override;
   void ActBeforeDifferentiatingCallExpr(
       llvm::SmallVectorImpl<clang::Expr*>& pullbackArgs,
-      llvm::SmallVectorImpl<clang::DeclStmt*>& ArgDecls,
-      bool hasAssignee) override;
+      llvm::SmallVectorImpl<clang::Stmt*>& ArgDecls, bool hasAssignee) override;
   void ActBeforeFinalizingVisitDeclStmt(
       llvm::SmallVectorImpl<clang::Decl*>& decls,
       llvm::SmallVectorImpl<clang::Decl*>& declsDiff) override;

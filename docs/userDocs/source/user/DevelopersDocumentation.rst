@@ -46,8 +46,8 @@ To build clad and its documentation, use the following CMake command:
 The built user documentation can be found in `build/docs/userDocs/build`; 
 while the built internal documentation can be found in `build/docs/internalDocs/build`.
 
-Linux (Ubuntu) with debug build of LLVM
------------------------------------------
+Developers Environment (Linux) - debug build of LLVM, Clang and Clad from source
+----------------------------------------------------------------------------------
 
 Clad is a plugin for LLVM Clang compiler infrastructure. Clad uses
 Clang and LLVM APIs. Therefore, to properly debug Clad, you will also
@@ -62,18 +62,32 @@ instructions:
 
 .. code-block:: bash
 
-   sudo -H pip install lit
+   python -m pip install lit
    git clone https://github.com/llvm/llvm-project.git
    cd llvm-project
-   git checkout release/12.x
-   cd ../
-   mkdir obj inst
-   cd obj
-   cmake ../llvm-project/llvm -DCMAKE_BUILD_TYPE=Debug -DLLVM_TARGETS_TO_BUILD=host -DLLVM_ENABLE_PROJECTS=clang -DCMAKE_INSTALL_PREFIX=../inst
-   make install
+   git checkout llvmorg-16.0.0
+
+Build Clang:
+
+.. code-block:: bash
+
+   mkdir build && cd build
+   cmake -DLLVM_ENABLE_PROJECTS="clang" -DCMAKE_BUILD_TYPE="DEBUG" -DLLVM_TARGETS_TO_BUILD=host -DLLVM_INSTALL_UTILS=ON ../llvm
+   cmake --build . --target clang --parallel $(nproc --all)
+   make -j8 check-clang # this installs llvm-config required by lit
+   cd ../..
+
+Clone and build Clad:
+
+.. code-block:: bash
+
+   git clone https://github.com/vgvassilev/clad.git
+   cd clad
+   mkdir build && cd build
+   cmake -DLLVM_DIR=PATH/TO/llvm-project/build -DCMAKE_BUILD_TYPE=DEBUG -DLLVM_EXTERNAL_LIT="$(which lit)" ../
+   make -j8 clad
 
 Please note that it is recommended to have at least 16 GB of total memory (RAM + swap) to build LLVM in debug mode.
-
 
 To build Clad with Debug build of LLVM, adjust the ``-DClang_DIR`` and 
 ``-DLLVM_DIR`` options to point to installation home of debug build of LLVM.
@@ -111,7 +125,38 @@ to understand for the new developers.
 
 Internal documentation can be visited 
 `here </en/latest/internalDocs/html/index.html>`_
- 
+
+In case you are interested in seeing the big picture and are just getting 
+started with Clang, there is a document that might help you:
+`Introduction to Clang for Clad contributors </en/latest/user/IntroductionToClangForCladContributors.html>`_. It covers 
+most of the basic concepts in Clang that Clad uses and describes the operation
+of the latter with examples for newcomers specifically.
+
+Clad's Tests
+============
+
+Clad uses LLVM's testing infrastructure.
+`Here <https://llvm.org/docs/CommandGuide/lit.html>`__ is extensive information
+about the lit testing infrastructure in LLVM. The tests are located in the
+folder ``test`` and ``unittest``. The ``test`` folder contains lit-based tests
+which check the execution result and the produced code. The ``unittest`` folder
+contains GoogleTest-based tests which are compiled.
+
+The tests can be run with:
+
+.. code-block:: bash
+
+   cmake --build . --target check-clad
+
+When developing a feature sometimes fixing all the outputs of the tests to see
+if the feature does not break the execution of the programs is too laborious.
+For such cases we can run only the execution result checks and ignore
+temporarily the differences in the produced outputs with:
+
+.. code-block:: bash
+
+   cmake --build . --target check-clad-execonly
+
 
 Debugging Clang
 ==================
@@ -254,3 +299,46 @@ Now, to ssh into the GitHub runner do, simply do::
   ssh SSH_KEY
 
 No username or password is required.
+
+Debugging x86 builds locally
+============================
+
+It is possible to use a local namespace container using ``systemd-nspawn``.
+In order to replicate the CI environment as closely as possible it is recommended to use
+an Alpine mini root filesystem, which can be downloaded from `Alpine Downloads <https://alpinelinux.org/downloads/>`_.
+After downloading, the container can be set up in the ``~/alpine32/`` directory with the
+following commands:
+
+.. code-block:: sh
+
+   mkdir ~/alpine32/
+   tar -C ~/alpine32/ -xpf alpine-minirootfs-*.tar.gz
+
+A shell inside the container can be created with:
+
+.. code-block:: sh
+
+   sudo systemd-nspawn --personality=x86 -D ~/alpine32/
+
+When in the container the neccessary tools can be installed with:
+
+.. code-block:: sh
+
+   apk add llvm llvm-dev llvm-gtest llvm-static clang clang-dev clang-static make cmake git
+
+Then clad can be built:
+
+.. code-block:: sh
+
+   git clone https://github.com/vgvassilev/clad.git
+   cd clad/
+   mkdir build/ && cd build/
+   cmake -DLLVM_EXTERNAL_LIT="$(which lit)" ../
+   make -j$(nproc --all) clad
+
+If debugging it could be useful to add ``-DCMAKE_BUILD_TYPE=Debug`` to the ``cmake`` command
+and specifying the ``check-clad`` target when running ``make`` in order to also run the tests.
+
+*Note:* LLDB can't run any processes on x86 [#lldb-x86-bug]_, but GDB can be used instead.
+
+.. [#lldb-x86-bug] https://bugs.llvm.org/show_bug.cgi?id=45852

@@ -9,6 +9,7 @@
 #include "clad/Differentiator/DerivativeBuilder.h"
 #include "clad/Differentiator/EstimationModel.h"
 
+#include "clad/Differentiator/Sins.h"
 #include "clad/Differentiator/Version.h"
 
 #include "clang/AST/ASTConsumer.h"
@@ -31,35 +32,6 @@
 #include <algorithm>
 
 using namespace clang;
-
-namespace {
-  class SimpleTimer {
-    bool WantTiming;
-    llvm::TimeRecord Start;
-    std::string Output;
-
-  public:
-    explicit SimpleTimer(bool WantTiming) : WantTiming(WantTiming) {
-      if (WantTiming)
-        Start = llvm::TimeRecord::getCurrentTime();
-    }
-
-    void setOutput(const Twine &Output) {
-      if (WantTiming)
-        this->Output = Output.str();
-    }
-
-    ~SimpleTimer() {
-      if (WantTiming) {
-        llvm::TimeRecord Elapsed = llvm::TimeRecord::getCurrentTime();
-        Elapsed -= Start;
-        llvm::errs() << Output << ": user | system | process | all :";
-        Elapsed.print(Elapsed, llvm::errs());
-        llvm::errs() << '\n';
-      }
-    }
-  };
-}
 
 namespace clad {
   namespace plugin {
@@ -103,78 +75,73 @@ namespace clad {
     CladPlugin::CladPlugin(CompilerInstance& CI, DifferentiationOptions& DO)
         : m_CI(CI), m_DO(DO), m_HasRuntime(false) {
 #if CLANG_VERSION_MAJOR > 8
-
       FrontendOptions& Opts = CI.getFrontendOpts();
       // Find the path to clad.
       llvm::StringRef CladSoPath;
       for (llvm::StringRef P : Opts.Plugins)
-        if (llvm::sys::path::stem(P).endswith("clad")) {
+        if (llvm::sys::path::stem(P).ends_with("clad")) {
           CladSoPath = P;
           break;
         }
 
-      // Register clad as a backend pass.
-      CodeGenOptions& CGOpts = CI.getCodeGenOpts();
-      CGOpts.PassPlugins.push_back(CladSoPath.str());
+      if (!CladSoPath.empty()) {
+        // Register clad as a backend pass.
+        CodeGenOptions& CGOpts = CI.getCodeGenOpts();
+        CGOpts.PassPlugins.push_back(CladSoPath.str());
+      }
 #endif // CLANG_VERSION_MAJOR > 8
     }
 
     CladPlugin::~CladPlugin() {}
 
-    // We cannot use HandleTranslationUnit because codegen already emits code on
-    // HandleTopLevelDecl calls and makes updateCall with no effect.
-    bool CladPlugin::HandleTopLevelDecl(DeclGroupRef DGR) {
+    ALLOW_ACCESS(MultiplexConsumer, Consumers,
+                 std::vector<std::unique_ptr<ASTConsumer>>);
+
+    void CladPlugin::Initialize(clang::ASTContext& C) {
+      // We know we have a multiplexer. We commit a sin here by stealing it and
+      // making the consumer pass-through so that we can delay all operations
+      // until clad is happy.
+
+      auto& MultiplexC = cast<MultiplexConsumer>(m_CI.getASTConsumer());
+      auto& RobbedCs = ACCESS(MultiplexC, Consumers);
+      assert(RobbedCs.back().get() == this && "Clad is not the last consumer");
+      std::vector<std::unique_ptr<ASTConsumer>> StolenConsumers;
+
+      // The range-based for loop in MultiplexConsumer::Initialize has
+      // dispatched this call. Generally, it is unsafe to delete elements while
+      // iterating but we know we are in the end of the loop and ::end() won't
+      // be invalidated.
+      std::move(RobbedCs.begin(), RobbedCs.end() - 1,
+                std::back_inserter(StolenConsumers));
+      RobbedCs.erase(RobbedCs.begin(), RobbedCs.end() - 1);
+      m_Multiplexer.reset(new MultiplexConsumer(std::move(StolenConsumers)));
+    }
+
+    void CladPlugin::HandleTopLevelDeclForClad(DeclGroupRef DGR) {
       if (!CheckBuiltins())
-        return true;
+        return;
 
       Sema& S = m_CI.getSema();
 
       if (!m_DerivativeBuilder)
-        m_DerivativeBuilder.reset(new DerivativeBuilder(m_CI.getSema(), *this));
+        m_DerivativeBuilder.reset(
+            new DerivativeBuilder(S, *this, m_DFC, m_DiffRequestGraph));
 
-      // if HandleTopLevelDecl was called through clad we don't need to process
-      // it for diff requests
-      if (m_HandleTopLevelDeclInternal)
-        return true;
-
-      DiffSchedule requests{};
-      DiffCollector collector(DGR, CladEnabledRange, requests, m_CI.getSema());
-
-      if (requests.empty())
-        return true;
-
-      // FIXME: flags have to be set manually since DiffCollector's constructor
-      // does not have access to m_DO.
-      if (m_DO.EnableTBRAnalysis)
-        for (DiffRequest& request : requests)
-          request.EnableTBRAnalysis = true;
-
-      // FIXME: Remove the PerformPendingInstantiations altogether. We should
-      // somehow make the relevant functions referenced.
-      // Instantiate all pending for instantiations templates, because we will
-      // need the full bodies to produce derivatives.
-      // FIXME: Confirm if we really need `m_PendingInstantiationsInFlight`?
-      if (!m_PendingInstantiationsInFlight) {
-        m_PendingInstantiationsInFlight = true;
-        S.PerformPendingInstantiations();
-        m_PendingInstantiationsInFlight = false;
-      }
-
-      for (DiffRequest& request : requests)
-        ProcessDiffRequest(request);
-      return true; // Happiness
-    }
-
-    void CladPlugin::ProcessTopLevelDecl(Decl* D) {
-      m_HandleTopLevelDeclInternal = true;
-      m_CI.getASTConsumer().HandleTopLevelDecl(DeclGroupRef(D));
-      m_HandleTopLevelDeclInternal = false;
+      RequestOptions opts{};
+      SetRequestOptions(opts);
+      DiffCollector collector(DGR, CladEnabledRange, m_DiffRequestGraph, S,
+                              opts);
+      // We could not delay the processing of derivatives, inform act as if each
+      // call is final. That would still have vgvassilev/clad#248 unresolved.
+      if (!m_Multiplexer)
+        FinalizeTranslationUnit();
     }
 
     FunctionDecl* CladPlugin::ProcessDiffRequest(DiffRequest& request) {
       Sema& S = m_CI.getSema();
       // Required due to custom derivatives function templates that might be
       // used in the function that we need to derive.
+      // FIXME: Remove the call to PerformPendingInstantiations().
       S.PerformPendingInstantiations();
       if (request.Function->getDefinition())
         request.Function = request.Function->getDefinition();
@@ -212,7 +179,8 @@ namespace clad {
              it != ie; ++it) {
           auto estimationPlugin = it->instantiate();
           m_DerivativeBuilder->AddErrorEstimationModel(
-              estimationPlugin->InstantiateCustomModel(*m_DerivativeBuilder));
+              estimationPlugin->InstantiateCustomModel(*m_DerivativeBuilder,
+                                                       request));
         }
       }
 
@@ -228,9 +196,12 @@ namespace clad {
         // FIXME: Move the timing inside the DerivativeBuilder. This would
         // require to pass in the DifferentiationOptions in the DiffPlan.
         // derive the collected functions
-        bool WantTiming = getenv("LIBCLAD_TIMING");
-        SimpleTimer Timer(WantTiming);
-        Timer.setOutput("Generation time for " + FD->getNameAsString());
+
+#if CLANG_VERSION_MAJOR > 11
+        bool WantTiming = m_CI.getCodeGenOpts().TimePasses;
+#else
+        bool WantTiming = m_CI.getFrontendOpts().ShowTimers;
+#endif
 
         auto DFI = m_DFC.Find(request);
         if (DFI.IsValid()) {
@@ -238,9 +209,16 @@ namespace clad {
           OverloadedDerivativeDecl = DFI.OverloadedDerivedFn();
           alreadyDerived = true;
         } else {
+          // Only time the function when it is first encountered
+          if (WantTiming)
+            m_CTG.StartNewTimer("Timer for clad func",
+                                request.BaseFunctionName);
+
           auto deriveResult = m_DerivativeBuilder->Derive(request);
           DerivativeDecl = deriveResult.derivative;
           OverloadedDerivativeDecl = deriveResult.overload;
+          if (WantTiming)
+            m_CTG.StopTimer();
         }
       }
 
@@ -252,6 +230,8 @@ namespace clad {
           // if enabled, print source code of the derived functions
           if (m_DO.DumpDerivedFn) {
             DerivativeDecl->print(llvm::outs(), Policy);
+            if (request.DeclarationOnly)
+              llvm::outs() << ";\n";
           }
 
           // if enabled, print ASTs of the derived functions
@@ -265,6 +245,8 @@ namespace clad {
             llvm::raw_fd_ostream f("Derivatives.cpp", err,
                                    CLAD_COMPAT_llvm_sys_fs_Append);
             DerivativeDecl->print(f, Policy);
+            if (request.DeclarationOnly)
+              f << ";\n";
             f.flush();
           }
 
@@ -285,6 +267,8 @@ namespace clad {
 
           // Call CodeGen only if the produced Decl is a top-most
           // decl or is contained in a namespace decl.
+          // FIXME: We could get rid of this by prepending the produced
+          // derivatives in CladPlugin::HandleTranslationUnitDecl
           DeclContext* derivativeDC = DerivativeDecl->getDeclContext();
           bool isTUorND =
               derivativeDC->isTranslationUnit() || derivativeDC->isNamespace();
@@ -302,6 +286,9 @@ namespace clad {
           request.updateCall(DerivativeDecl, OverloadedDerivativeDecl,
                              m_CI.getSema());
 
+        if (request.DeclarationOnly)
+          request.DerivedFDPrototypes.push_back(DerivativeDecl);
+
         // Last requested order was computed, return the result.
         if (lastDerivativeOrder)
           return DerivativeDecl;
@@ -312,6 +299,71 @@ namespace clad {
         return ProcessDiffRequest(request);
       }
       return nullptr;
+    }
+
+    void CladPlugin::SendToMultiplexer() {
+      for (unsigned i = m_MultiplexerProcessedDelayedCallsIdx;
+           i < m_DelayedCalls.size(); ++i) {
+        auto DelayedCall = m_DelayedCalls[i];
+        DeclGroupRef& D = DelayedCall.m_DGR;
+        switch (DelayedCall.m_Kind) {
+        case CallKind::HandleCXXStaticMemberVarInstantiation:
+          m_Multiplexer->HandleCXXStaticMemberVarInstantiation(
+              cast<VarDecl>(D.getSingleDecl()));
+          break;
+        case CallKind::HandleTopLevelDecl:
+          m_Multiplexer->HandleTopLevelDecl(D);
+          break;
+        case CallKind::HandleInlineFunctionDefinition:
+          m_Multiplexer->HandleInlineFunctionDefinition(
+              cast<FunctionDecl>(D.getSingleDecl()));
+          break;
+        case CallKind::HandleInterestingDecl:
+          m_Multiplexer->HandleInterestingDecl(D);
+          break;
+        case CallKind::HandleTagDeclDefinition:
+          m_Multiplexer->HandleTagDeclDefinition(
+              cast<TagDecl>(D.getSingleDecl()));
+          break;
+        case CallKind::HandleTagDeclRequiredDefinition:
+          m_Multiplexer->HandleTagDeclRequiredDefinition(
+              cast<TagDecl>(D.getSingleDecl()));
+          break;
+        case CallKind::HandleCXXImplicitFunctionInstantiation:
+          m_Multiplexer->HandleCXXImplicitFunctionInstantiation(
+              cast<FunctionDecl>(D.getSingleDecl()));
+          break;
+        case CallKind::HandleTopLevelDeclInObjCContainer:
+          m_Multiplexer->HandleTopLevelDeclInObjCContainer(D);
+          break;
+        case CallKind::HandleImplicitImportDecl:
+          m_Multiplexer->HandleImplicitImportDecl(
+              cast<ImportDecl>(D.getSingleDecl()));
+          break;
+        case CallKind::CompleteTentativeDefinition:
+          m_Multiplexer->CompleteTentativeDefinition(
+              cast<VarDecl>(D.getSingleDecl()));
+          break;
+#if CLANG_VERSION_MAJOR > 9
+        case CallKind::CompleteExternalDeclaration:
+          m_Multiplexer->CompleteExternalDeclaration(
+              cast<VarDecl>(D.getSingleDecl()));
+          break;
+#endif
+        case CallKind::AssignInheritanceModel:
+          m_Multiplexer->AssignInheritanceModel(
+              cast<CXXRecordDecl>(D.getSingleDecl()));
+          break;
+        case CallKind::HandleVTable:
+          m_Multiplexer->HandleVTable(cast<CXXRecordDecl>(D.getSingleDecl()));
+          break;
+        case CallKind::InitializeSema:
+          m_Multiplexer->InitializeSema(m_CI.getSema());
+          break;
+        };
+      }
+
+      m_MultiplexerProcessedDelayedCallsIdx = m_DelayedCalls.size();
     }
 
     bool CladPlugin::CheckBuiltins() {
@@ -336,7 +388,140 @@ namespace clad {
       m_HasRuntime = !R.empty();
       return m_HasRuntime;
     }
+
+    static void SetTBRAnalysisOptions(const DifferentiationOptions& DO,
+                                      RequestOptions& opts) {
+      // If user has explicitly specified the mode for TBR analysis, use it.
+      if (DO.EnableTBRAnalysis || DO.DisableTBRAnalysis)
+        opts.EnableTBRAnalysis = DO.EnableTBRAnalysis && !DO.DisableTBRAnalysis;
+      else
+        opts.EnableTBRAnalysis = false; // Default mode.
+    }
+
+    void CladPlugin::SetRequestOptions(RequestOptions& opts) const {
+      SetTBRAnalysisOptions(m_DO, opts);
+    }
+
+    void CladPlugin::FinalizeTranslationUnit() {
+      Sema& S = m_CI.getSema();
+      // Restore the TUScope that became a 0 in Sema::ActOnEndOfTranslationUnit.
+      if (!m_CI.getPreprocessor().isIncrementalProcessingEnabled())
+        S.TUScope = m_StoredTUScope;
+      constexpr bool Enabled = true;
+      Sema::GlobalEagerInstantiationScope GlobalInstantiations(S, Enabled);
+      Sema::LocalEagerInstantiationScope LocalInstantiations(S);
+
+      if (!m_DiffRequestGraph.isProcessingNode()) {
+        // This check is to avoid recursive processing of the graph, as
+        // HandleTopLevelDecl can be called recursively in non-standard
+        // setup for code generation.
+        DiffRequest request = m_DiffRequestGraph.getNextToProcessNode();
+        while (request.Function) {
+          m_DiffRequestGraph.setCurrentProcessingNode(request);
+          ProcessDiffRequest(request);
+          m_DiffRequestGraph.markCurrentNodeProcessed();
+          request = m_DiffRequestGraph.getNextToProcessNode();
+        }
+      }
+
+      // Put the TUScope in a consistent state after clad is done.
+      if (!m_CI.getPreprocessor().isIncrementalProcessingEnabled())
+        S.TUScope = nullptr;
+
+      // Force emission of the produced pending template instantiations.
+      LocalInstantiations.perform();
+      GlobalInstantiations.perform();
+    }
+
+    void CladPlugin::HandleTranslationUnit(ASTContext& C) {
+      FinalizeTranslationUnit();
+      SendToMultiplexer();
+      m_Multiplexer->HandleTranslationUnit(C);
+    }
+
+    void CladPlugin::PrintStats() {
+      llvm::errs() << "*** INFORMATION ABOUT THE DELAYED CALLS\n";
+      for (const DelayedCallInfo& DCI : m_DelayedCalls) {
+        llvm::errs() << "   ";
+        switch (DCI.m_Kind) {
+        case CallKind::HandleCXXStaticMemberVarInstantiation:
+          llvm::errs() << "HandleCXXStaticMemberVarInstantiation";
+          break;
+        case CallKind::HandleTopLevelDecl:
+          llvm::errs() << "HandleTopLevelDecl";
+          break;
+        case CallKind::HandleInlineFunctionDefinition:
+          llvm::errs() << "HandleInlineFunctionDefinition";
+          break;
+        case CallKind::HandleInterestingDecl:
+          llvm::errs() << "HandleInterestingDecl";
+          break;
+        case CallKind::HandleTagDeclDefinition:
+          llvm::errs() << "HandleTagDeclDefinition";
+          break;
+        case CallKind::HandleTagDeclRequiredDefinition:
+          llvm::errs() << "HandleTagDeclRequiredDefinition";
+          break;
+        case CallKind::HandleCXXImplicitFunctionInstantiation:
+          llvm::errs() << "HandleCXXImplicitFunctionInstantiation";
+          break;
+        case CallKind::HandleTopLevelDeclInObjCContainer:
+          llvm::errs() << "HandleTopLevelDeclInObjCContainer";
+          break;
+        case CallKind::HandleImplicitImportDecl:
+          llvm::errs() << "HandleImplicitImportDecl";
+          break;
+        case CallKind::CompleteTentativeDefinition:
+          llvm::errs() << "CompleteTentativeDefinition";
+          break;
+#if CLANG_VERSION_MAJOR > 9
+        case CallKind::CompleteExternalDeclaration:
+          llvm::errs() << "CompleteExternalDeclaration";
+          break;
+#endif
+        case CallKind::AssignInheritanceModel:
+          llvm::errs() << "AssignInheritanceModel";
+          break;
+        case CallKind::HandleVTable:
+          llvm::errs() << "HandleVTable";
+          break;
+        case CallKind::InitializeSema:
+          llvm::errs() << "InitializeSema";
+          break;
+        };
+        for (const clang::Decl* D : DCI.m_DGR) {
+          llvm::errs() << " " << D;
+          if (const auto* ND = dyn_cast<NamedDecl>(D))
+            llvm::errs() << " " << ND->getNameAsString();
+        }
+        llvm::errs() << "\n";
+      }
+
+      // Print the graph of the diff requests.
+      llvm::errs() << "\n*** INFORMATION ABOUT THE DIFF REQUESTS\n";
+      m_DiffRequestGraph.print();
+
+      m_Multiplexer->PrintStats();
+    }
+
   } // end namespace plugin
+
+  clad::CladTimerGroup::CladTimerGroup()
+      : m_Tg("Timers for Clad Funcs", "Timers for Clad Funcs") {}
+
+  void clad::CladTimerGroup::StartNewTimer(llvm::StringRef TimerName,
+                                           llvm::StringRef TimerDesc) {
+      std::unique_ptr<llvm::Timer> tm(
+          new llvm::Timer(TimerName, TimerDesc, m_Tg));
+      m_Timers.push_back(std::move(tm));
+      m_Timers.back()->startTimer();
+  }
+
+  void clad::CladTimerGroup::StopTimer() {
+      m_Timers.back()->stopTimer();
+      if (m_Timers.size() != 1)
+        m_Timers.pop_back();
+  }
 
   // Routine to check clang version at runtime against the clang version for
   // which clad was built.
@@ -347,41 +532,6 @@ namespace clad {
       return false;
     else
       return true;
-  }
-
-  void DerivedFnCollector::Add(const DerivedFnInfo& DFI) {
-    assert(!AlreadyExists(DFI) &&
-           "We are generating same derivative more than once, or calling "
-           "`DerivedFnCollector::Add` more than once for the same derivative "
-           ". Ideally, we shouldn't do either.");
-    m_DerivedFnInfoCollection[DFI.OriginalFn()].push_back(DFI);
-  }
-
-  bool DerivedFnCollector::AlreadyExists(const DerivedFnInfo& DFI) const {
-    auto subCollectionIt = m_DerivedFnInfoCollection.find(DFI.OriginalFn());
-    if (subCollectionIt == m_DerivedFnInfoCollection.end())
-      return false;
-    auto& subCollection = subCollectionIt->second;
-    auto it = std::find_if(subCollection.begin(), subCollection.end(),
-                           [&DFI](const DerivedFnInfo& info) {
-                             return DerivedFnInfo::
-                                 RepresentsSameDerivative(DFI, info);
-                           });
-    return it != subCollection.end();
-  }
-
-  DerivedFnInfo DerivedFnCollector::Find(const DiffRequest& request) const {
-    auto subCollectionIt = m_DerivedFnInfoCollection.find(request.Function);
-    if (subCollectionIt == m_DerivedFnInfoCollection.end())
-      return DerivedFnInfo();
-    auto& subCollection = subCollectionIt->second;
-    auto it = std::find_if(subCollection.begin(), subCollection.end(),
-                           [&request](DerivedFnInfo DFI) {
-                             return DFI.SatisfiesRequest(request);
-                           });
-    if (it == subCollection.end())
-      return DerivedFnInfo();
-    return *it;
   }
 } // end namespace clad
 

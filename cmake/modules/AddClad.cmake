@@ -1,24 +1,27 @@
-# Find the current branch.
-execute_process(WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                COMMAND git rev-parse HEAD
-                OUTPUT_VARIABLE CURRENT_REPO_COMMIT
-                OUTPUT_STRIP_TRAILING_WHITESPACE)
-string(REPLACE "/" "" CURRENT_REPO_COMMIT ${CURRENT_REPO_COMMIT})
+if (CLAD_ENABLE_BENCHMARKS)
+  # Find the current branch.
+  execute_process(WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                  COMMAND git rev-parse HEAD
+                  OUTPUT_VARIABLE CURRENT_REPO_COMMIT
+                  OUTPUT_STRIP_TRAILING_WHITESPACE)
+  string(REPLACE "/" "" CURRENT_REPO_COMMIT ${CURRENT_REPO_COMMIT})
 
 # Ask cmake to reconfigure each time we change the branch so that it can change
 # the value of CURRENT_REPO_COMMIT.
 set_property(DIRECTORY APPEND PROPERTY
              CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/.git/HEAD")
 
+endif(CLAD_ENABLE_BENCHMARKS)
+
 #-------------------------------------------------------------------------------
-# function ENABLE_CLAD_FOR_EXECUTABLE(<executable>
+# function ENABLE_CLAD_FOR_TARGET(<executable>
 #   DEPENDS dependencies...
 #     A list of targets that the executable depends on.
 #   LIBRARIES libraries...
 #     A list of libraries to be linked in. Defaults to stdc++ pthread m.
 # )
 #-------------------------------------------------------------------------------
-function(ENABLE_CLAD_FOR_EXECUTABLE executable)
+function(ENABLE_CLAD_FOR_TARGET executable)
   if (NOT TARGET ${executable})
     message(FATAL_ERROR "'${executable}' is not a valid target.")
   endif()
@@ -53,7 +56,26 @@ function(ENABLE_CLAD_FOR_EXECUTABLE executable)
     add_dependencies(${executable} ${ARG_DEPENDS})
   endif(ARG_DEPENDS)
 
-endfunction(ENABLE_CLAD_FOR_EXECUTABLE)
+endfunction(ENABLE_CLAD_FOR_TARGET)
+
+#-------------------------------------------------------------------------------
+# function ADD_CLAD_LIBRARY(<library> sources...
+#   DEPENDS dependencies...
+#     A list of targets that the library depends on.
+#   LIBRARIES libraries...
+#     A list of libraries to be linked in. Defaults to stdc++ pthread m.
+# )
+#-------------------------------------------------------------------------------
+function(ADD_CLAD_LIBRARY library)
+  cmake_parse_arguments(ARG "" "DEPENDS;LIBRARIES" "" ${ARGN})
+
+  set(source_files ${ARG_UNPARSED_ARGUMENTS})
+
+  add_library (${library} ${source_files})
+  ENABLE_CLAD_FOR_TARGET(${library} ${ARGN})
+
+endfunction(ADD_CLAD_LIBRARY)
+
 
 #-------------------------------------------------------------------------------
 # function ADD_CLAD_EXECUTABLE(<executable> sources...
@@ -70,7 +92,7 @@ function(ADD_CLAD_EXECUTABLE executable)
 
   add_executable(${executable} ${source_files})
 
-  ENABLE_CLAD_FOR_EXECUTABLE(${executable} ${ARGN})
+  ENABLE_CLAD_FOR_TARGET(${executable} ${ARGN})
 
 endfunction(ADD_CLAD_EXECUTABLE)
 
