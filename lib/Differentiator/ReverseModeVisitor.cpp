@@ -3917,14 +3917,6 @@ Expr* getArraySizeExpr(const ArrayType* AT, ASTContext& context,
       return E;
     }
 
-    //auto pushPop = BuildPushPop(E, Type, prefix, force);
-    //if (!isInsideLoop) {
-    //  if (E) {
-    //    Expr* Set = BuildOp(BO_Assign, pushPop.getExpr(), E);
-    //    addToCurrentBlock(Set, direction::forward);
-    //  }
-    //}
-
     if (isInsideLoop) {
       CladTapeResult CladTape = MakeCladTapeFor(E, prefix);
       addToCurrentBlock(CladTape.Push, direction::forward);

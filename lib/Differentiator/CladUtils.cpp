@@ -269,17 +269,6 @@ namespace clad {
       return cast<NamespaceDecl>(ND->getPrimaryContext());
     }
 
-    clang::DeclContext* GetOutermostDC(Sema& semaRef, clang::DeclContext* DC) {
-      ASTContext& C = semaRef.getASTContext();
-      assert(DC && "Invalid DC");
-      while (DC) {
-        if (DC->getParent() == C.getTranslationUnitDecl())
-          break;
-        DC = DC->getParent();
-      }
-      return DC;
-    }
-
     clang::Expr* GetUnresolvedLookup(Sema& S, ASTContext& C, std::string NS, std::string FN) {
         NamespaceDecl* DC = utils::LookupNSD(S, NS, /*shouldExist=*/true);
 

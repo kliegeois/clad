@@ -2,7 +2,7 @@ add_custom_target(CladUnitTests)
 set_target_properties(CladUnitTests PROPERTIES FOLDER "Clad tests")
 
 # LLVM builds (not installed llvm) provides gtest.
-if (NOT TARGET gtest AND CLAD_BUILT_STANDALONE)
+if (NOT TARGET gtest)
   include(CladGoogleTest)
 endif()
 

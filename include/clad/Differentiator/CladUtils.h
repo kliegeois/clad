@@ -140,26 +140,6 @@ namespace clad {
                                     bool shouldExist,
                                     clang::DeclContext* DC = nullptr);
 
-    /// Returns the outermost declaration context, other than the translation
-    /// unit declaration, associated with DC. For example, consider a struct `S`
-    /// as follows:
-    ///
-    /// ```
-    /// namespace A {
-    ///   namespace B {
-    //    struct S {};
-    ///   }
-    /// }
-    /// ```
-    ///
-    /// In this case, outermost declaration context associated with `S` is of
-    /// namespace `A`.
-    ///
-    /// \param semaRef
-    /// \param[in] DC
-    clang::DeclContext* GetOutermostDC(clang::Sema& semaRef,
-                                       clang::DeclContext* DC);
-
     clang::Expr* GetUnresolvedLookup(clang::Sema& semaRef,
                                      clang::ASTContext& C,
                                      std::string NS,
@@ -204,7 +184,6 @@ namespace clad {
 
     /// Returns true if `arg` is an argument passed by reference or is of
     /// pointer/array type.
-
     ///
     /// \note Please note that this function returns false for temporary
     /// expressions.
