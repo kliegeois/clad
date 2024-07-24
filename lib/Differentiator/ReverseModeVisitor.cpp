@@ -3325,7 +3325,7 @@ Expr* getArraySizeExpr(const ArrayType* AT, ASTContext& context,
           Expr* derivedVDE = BuildDeclRef(VDDerived);
           m_Variables.emplace(VDClone, derivedVDE);
 
-          return VarDeclDiff(VDClone, VDDerived);
+          //return VarDeclDiff(VDClone, VDDerived);
         }
         else 
           assert(false &&
@@ -3914,16 +3914,16 @@ Expr* getArraySizeExpr(const ArrayType* AT, ASTContext& context,
       return E;
 
     if (isInsideParallelRegion) {
-      return {E, E};
+      return E;
     }
 
-    auto pushPop = BuildPushPop(E, Type, prefix, force);
-    if (!isInsideLoop) {
-      if (E) {
-        Expr* Set = BuildOp(BO_Assign, pushPop.getExpr(), E);
-        addToCurrentBlock(Set, direction::forward);
-      }
-    }
+    //auto pushPop = BuildPushPop(E, Type, prefix, force);
+    //if (!isInsideLoop) {
+    //  if (E) {
+    //    Expr* Set = BuildOp(BO_Assign, pushPop.getExpr(), E);
+    //    addToCurrentBlock(Set, direction::forward);
+    //  }
+    //}
 
     if (isInsideLoop) {
       CladTapeResult CladTape = MakeCladTapeFor(E, prefix);

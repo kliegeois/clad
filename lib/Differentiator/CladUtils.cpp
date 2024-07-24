@@ -367,6 +367,7 @@ namespace clad {
 
     bool IsReferenceOrPointerType(QualType T) {
       return T->isReferenceType() || isArrayOrPointerType(T) || IsKokkosView(T);
+    }
 
     bool IsReferenceOrPointerArg(const Expr* arg) {
       // The argument is passed by reference if it's passed as an L-value.
